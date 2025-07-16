@@ -1,20 +1,25 @@
 import sys
 import os
 import glob
-import time 
 import polars as pl
 import openpyxl 
 import xlrd
 import json
+import re
+from unidecode import unidecode
+from collections import defaultdict
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QLineEdit, QLabel, QListWidget, QListWidgetItem,
     QComboBox, QProgressBar, QTextEdit, QFileDialog, QTabWidget, 
     QTableView, QDialogButtonBox, QTableWidget, QDialog, QTableWidgetItem,
-    QCheckBox, QHeaderView
+    QCheckBox, QHeaderView, QScrollArea, QGroupBox, QAbstractItemView, QStyle
 )
 from PySide6.QtCore import Qt, QThread, Signal , QAbstractTableModel
+from PySide6.QtGui import QColor, QPalette, QIcon, QAction, QTextCursor
+from PySide6.QtSvgWidgets import QSvgWidget
+from PySide6.QtWidgets import QRadioButton
 from enum import Enum
 
 # Definir os tipos de dados que o usuário pode escolher
@@ -27,27 +32,264 @@ TYPE_STRING_TO_POLARS = {
     "Data": pl.Date, # ou pl.Datetime se precisar de hora
     "Booleano": pl.Boolean
 }
+# --- Constantes para as Opções de Filtro ---
+OPERATOR_OPTIONS = [
+    "Igual a",
+    "Diferente de",
+    "Contém",
+    "Não contém",
+    "Começa com",
+    "Termina com",
+    "Maior que",
+    "Menor que",
+    "Entre",
+    "Está em branco",
+    "Não está em branco",
+]
+# Operadores que não precisam de um campo de valor
+OPERATORS_NO_VALUE = {"Está em branco", "Não está em branco"}
 
 CONFIG_FILE_NAME = "config_consolidador.json" # Nome do arquivo de configuração
 
-# ... (LogLevel e ConsolidationWorker aqui) ...
+def _normalize_header_name(header_name: str) -> str:
+    if not isinstance(header_name, str):
+        header_name = str(header_name)
+    
+    # 1. Remove acentos (ex: "Endereço" -> "Endereco")
+    text = unidecode(header_name)
+    # 2. Converte para minúsculas
+    text = text.lower()
+    # 3. Substitui separadores comuns por espaço (para depois lidar com "valorICMS" vs "valor_ICMS")
+    text = re.sub(r'[._-]+', ' ', text)
+    # 4. Adiciona espaço antes de letras maiúsculas (camelCase -> camel Case)
+    text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)
+    # 5. Remove todos os caracteres não alfanuméricos e junta tudo
+    text = re.sub(r'[^a-z0-9]', '', text)
+    return text
+
+def _find_header_row_index(df_sample: pl.DataFrame, max_rows_to_check: int = 20) -> int:
+    """
+    Analisa as primeiras N linhas de um DataFrame e retorna o índice da linha
+    que tem a maior probabilidade de ser o cabeçalho, usando uma heurística de
+    transição de tipos.
+    """
+    best_score = -999
+    header_row_index = 0
+    rows_to_check = min(df_sample.height, max_rows_to_check)
+
+    # Nós só podemos checar até a penúltima linha, pois sempre olhamos para a linha seguinte
+    for i in range(rows_to_check - 1):
+        row_current = df_sample.row(i)
+        row_next = df_sample.row(i + 1)
+        
+        # --- Cálculo da Pontuação da Linha Atual (baseado na lógica anterior) ---
+        base_score = 0
+        string_count = 0
+        null_count = 0
+        numeric_string_count = 0
+        
+        for value in row_current:
+            if value is None: null_count += 1
+            elif isinstance(value, str) and value.strip():
+                string_count += 1
+                if value.strip().isnumeric(): numeric_string_count += 1
+        
+        num_cells = len(row_current)
+        non_null_cells = num_cells - null_count
+
+        if non_null_cells == 0:
+            base_score = -100
+        else:
+            uniqueness_ratio = len(set(v for v in row_current if v is not None)) / non_null_cells
+            string_ratio = string_count / non_null_cells
+            numeric_string_ratio = numeric_string_count / non_null_cells
+            base_score += uniqueness_ratio * 3
+            base_score += string_ratio * 3
+            base_score -= numeric_string_ratio * 5
+            base_score -= (null_count / num_cells) * 2
+
+        # --- NOVA HEURÍSTICA: Pontuação por Transição de Tipos ---
+        transition_score = 0
+        for j in range(num_cells):
+            type_current = type(row_current[j])
+            type_next = type(row_next[j])
+            
+            # Recompensa fortemente a transição de Texto para Número
+            if type_current is str and type_next in (int, float):
+                transition_score += 1
+            # Penaliza levemente se os tipos são iguais (exceto None)
+            elif type_current is not None and type_current == type_next:
+                transition_score -= 0.2
+
+        transition_bonus = (transition_score / num_cells) * 5 # Bônus forte
+        
+        # Combina as pontuações
+        final_score = base_score + transition_bonus
+        
+        if final_score > best_score:
+            best_score = final_score
+            header_row_index = i
+            
+    return header_row_index
+
 class LogLevel(Enum):
     INFO = "[INFO]"
     WARNING = "[AVISO]"
     ERROR = "[ERRO]"
     SUCCESS = "[SUCESSO]"
 
+class FilterDialog(QDialog):
+    def __init__(self, final_headers, existing_filters=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Definir Filtros de Dados")
+        self.setMinimumSize(600, 400)
+
+        self.final_headers = sorted(final_headers)
+        self.filter_rows = []  # Para manter referência aos widgets de cada linha
+
+        # --- Layout Principal ---
+        main_layout = QVBoxLayout(self)
+
+        # --- Descrição ---
+        description_label = QLabel("Adicione regras para filtrar os dados. Regras na mesma coluna (exceto 'Entre') são unidas com OU. Grupos de colunas diferentes são unidos com E.")
+        main_layout.addWidget(description_label)
+
+        # --- Layout para as Linhas de Filtro ---
+        self.filters_layout = QVBoxLayout()
+        self.filters_layout.setAlignment(Qt.AlignTop)
+
+        # Widget e ScrollArea para conter as linhas de filtro
+        filters_widget = QWidget()
+        filters_widget.setLayout(self.filters_layout)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(filters_widget)
+        main_layout.addWidget(scroll_area)
+
+        # --- Botões de Ação ---
+        add_filter_button = QPushButton("Adicionar Filtro")
+        add_filter_button.clicked.connect(self.add_filter_row)
+        main_layout.addWidget(add_filter_button)
+
+        # Botões OK e Cancelar
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        main_layout.addWidget(self.button_box)
+
+        # Preencher com filtros existentes ou iniciar com uma linha em branco
+        if existing_filters:
+            for f in existing_filters:
+                self.add_filter_row(filter_data=f)
+        else:
+            self.add_filter_row()
+
+    def add_filter_row(self, filter_data=None):
+        """Adiciona uma nova linha de widget para criar uma regra de filtro."""
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+
+        column_combo = QComboBox()
+        if self.final_headers:
+            column_combo.addItems(self.final_headers)
+        else:
+            column_combo.addItem("Nenhum cabeçalho mapeado"); column_combo.setEnabled(False)
+
+        operator_combo = QComboBox()
+        operator_combo.addItems(OPERATOR_OPTIONS)
+
+        value1_edit = QLineEdit()
+        value1_edit.setPlaceholderText("Valor")
+        and_label = QLabel(" e ")
+        value2_edit = QLineEdit()
+        value2_edit.setPlaceholderText("Valor Máximo")
+        
+        remove_button = QPushButton("X"); remove_button.setFixedWidth(30)
+        
+        row_layout.addWidget(column_combo)
+        row_layout.addWidget(operator_combo)
+        row_layout.addWidget(value1_edit)
+        row_layout.addWidget(and_label)
+        row_layout.addWidget(value2_edit)
+        row_layout.addWidget(remove_button)
+
+        # Guarda as referências aos widgets da linha para fácil acesso
+        row_widgets = {"widget": row_widget, "op_combo": operator_combo, "val1": value1_edit, "and_label": and_label, "val2": value2_edit}
+        self.filter_rows.append(row_widgets)
+
+        self.filters_layout.addWidget(row_widget)
+
+        # Conecta o botão de remover
+        remove_button.clicked.connect(lambda: self.remove_filter_row(row_widgets))
+        # Conecta a mudança do operador à lógica de visibilidade
+        operator_combo.currentTextChanged.connect(lambda text: self._on_operator_changed(text, row_widgets))
+        
+        # Preenche os dados se for um filtro existente
+        if filter_data:
+            column_combo.setCurrentText(filter_data.get("column", ""))
+            operator_combo.setCurrentText(filter_data.get("operator", ""))
+            if isinstance(filter_data.get("value"), list): # Se for "Entre"
+                value1_edit.setText(filter_data["value"][0])
+                value2_edit.setText(filter_data["value"][1])
+            else:
+                value1_edit.setText(filter_data.get("value", ""))
+
+        # Dispara a lógica de visibilidade para o estado inicial
+        self._on_operator_changed(operator_combo.currentText(), row_widgets)
+
+    def _on_operator_changed(self, text, row_widgets):
+        """Ajusta a visibilidade dos campos de valor com base no operador."""
+        is_between = (text == "Entre")
+        is_no_value = (text in OPERATORS_NO_VALUE)
+        
+        row_widgets["val1"].setVisible(not is_no_value)
+        row_widgets["and_label"].setVisible(is_between)
+        row_widgets["val2"].setVisible(is_between)
+
+    def remove_filter_row(self, row_widget):
+        """Remove uma linha de filtro da interface e da nossa lista de referência."""
+        if row_widget in self.filter_rows:
+            row_widget['widget'].deleteLater()
+            self.filter_rows.remove(row_widget)
+
+    def get_filters(self):
+        """Lê todos os widgets de filtro e retorna uma lista de dicionários com as regras."""
+        rules = []
+        for row_data in self.filter_rows:
+            # Encontrar os widgets filhos pelo nome do objeto seria mais robusto, mas isso funciona
+            column_combo = row_data["widget"].findChild(QComboBox)
+            operator = row_data["op_combo"].currentText()
+            
+            value = ""
+            if operator == "Entre":
+                val1 = row_data["val1"].text()
+                val2 = row_data["val2"].text()
+                value = [val1, val2] # Salva como uma lista
+            else:
+                value = row_data["val1"].text()
+
+            rules.append({
+                "column": column_combo.currentText(),
+                "operator": operator,
+                "value": value,
+            })
+        return rules
+
 class ConsolidationWorker(QThread):
     progress_updated = Signal(int) 
     log_message = Signal(str, LogLevel) 
     finished = Signal(bool, str) 
+    progress_text_updated = Signal(str)
 
-    def __init__(self, files_to_process, output_path, output_format, header_mapping):
+    def __init__(self, files_to_process, output_path, output_format, header_mapping, filter_rules, delimiter):
         super().__init__()
         self.files_to_process = files_to_process 
         self.output_path = output_path
         self.output_format = output_format
         self.header_mapping = header_mapping
+        self.filter_rules = filter_rules
+        self.delimiter = delimiter
         self.is_running = True
 
     def run(self):
@@ -74,67 +316,95 @@ class ConsolidationWorker(QThread):
                     if not self.is_running: break 
                     current_item_description = f"'{file_name}'" + (f" - Aba: '{sheet_name}'" if sheet_name else "")
                     try:
-                        df_original = None
-                        if sheet_name is None: 
-                            df_original = pl.read_csv(source=file_path, try_parse_dates=True, encoding = 'latin-1', separator = ';', infer_schema = False)
-                        else:
-                            try: 
-                                df_original = pl.read_excel(source=file_path, sheet_name=sheet_name)
-                            except pl.exceptions.PolarsError as e_excel:
-                                error_msg_lower = str(e_excel).lower()
-                                is_numeric_conversion_error = ('conversion' in error_msg_lower and 'f64' in error_msg_lower or 'float' in error_msg_lower) and ('i64' in error_msg_lower or 'int' in error_msg_lower) and 'failed' in error_msg_lower
-                                if is_numeric_conversion_error:
-                                    try:
-                                        df_temp = pl.read_excel(source = file_path, sheet_name = sheet_name, infer_schema_length = 0)
-                                        if df_temp is not None:
-                                            df_original = df_temp.select([pl.all().cast(pl.String)])
-                                            # df_preview_sliced = df_original.head(n_rows_to_preview)
-                                        else:
-                                            df_original = None
-                                    except Exception as e_retry_excel:
-                                        df_original = None
-                                else:
-                                    df_original = None
+                        # ETAPA 1: Pré-leitura e Detecção do Cabeçalho (continua igual e funcionando)
+                        n_preread_rows = 20
+                        header_row_index = 0
+                        header_names = []
+                        
+                        pre_read_df = None
+                        if file_path.lower().endswith((".csv", ".txt")):
+                            pre_read_df = pl.read_csv(source=file_path, has_header=False, n_rows=n_preread_rows, separator=self.delimiter, encoding='latin-1', ignore_errors=True, infer_schema = False, quote_char = None, truncate_ragged_lines = True)
+                        elif file_path.lower().endswith((".xlsx", ".xls")):
+                            pre_read_df = pl.read_excel(source=file_path, sheet_name=sheet_name, has_header = False).head(n_preread_rows)
 
-                        if df_original is None or df_original.height == 0:
+                        if pre_read_df is not None and not pre_read_df.is_empty():
+                            header_row_index = _find_header_row_index(pre_read_df, n_preread_rows)
+                            header_names = [str(h) if h is not None else f"column_{i}" for i, h in enumerate(pre_read_df.row(header_row_index))]
+                        
+                        # --- LÓGICA DE LEITURA FINAL E ROBUSTA ---
+                        df_original = None
+                        
+                        # Ler o arquivo inteiro como dados brutos, sem cabeçalho
+                        if file_path.lower().endswith((".csv", ".txt")):
+                            df_raw_data = pl.read_csv(source=file_path, has_header=False, separator=self.delimiter, encoding='latin-1', infer_schema = False, ignore_errors = True, quote_char = None, truncate_ragged_lines = True)
+                        elif file_path.lower().endswith((".xlsx", ".xls")):
+                            df_raw_data = pl.read_excel(source=file_path, sheet_name=sheet_name, has_header = False)
+                        
+                        if df_raw_data is not None and not df_raw_data.is_empty():
+                            # Fatiar o DataFrame para remover lixo + linha do cabeçalho
+                            df_data_only = df_raw_data.slice(offset=header_row_index + 1)
+                            
+                            if not df_data_only.is_empty():
+                                # Renomear as colunas com os nomes que detectamos
+                                rename_mapping = {old_name: new_name for old_name, new_name in zip(df_data_only.columns, header_names)}
+                                df_original = df_data_only.rename(rename_mapping)
+
+                        # Sua lógica de fallback para erros de conversão no Excel pode ser integrada aqui se necessário,
+                        # mas esta leitura primária é muito mais estável.
+                        
+                        if df_original is None or df_original.is_empty():
                             self.log_message.emit(f"Dados vazios ou erro ao ler {current_item_description}. Pulando.", LogLevel.WARNING)
-                            processed_items += 1 
+                            processed_items += 1
                             continue
 
-                        # --- 1. Aplicar Mapeamento de Nomes e Filtro de Colunas ---
-                        df_intermediate = df_original 
+                        # --- 1. Aplicar Mapeamento de Nomes e Filtro de Colunas (com Coalesce) ---
+                        df_intermediate = df_original
                         if self.header_mapping:
-                            selected_columns_expressions = []
-                            rename_map_for_select = {} # Para renomear DURANTE o select
-                            
-                            # Primeiro, determinar quais colunas originais manter e seus nomes finais
-                            # Estrutura auxiliar: {original_col: final_col_name_if_kept}
-                            cols_to_keep_and_their_final_names = {}
+                            # 1. Agrupar colunas de origem por seu nome final de destino
+                            final_name_to_source = defaultdict(list)
+                            for original_col_name in df_original.columns:
+                                source_key = (original_col_name, file_path, sheet_name)
+                                mapping_info = self.header_mapping.get(source_key)
+                                if mapping_info and mapping_info.get("include", False):
+                                    final_name = mapping_info.get("final_name")
+                                    final_name_to_source[final_name].append(original_col_name)
+                            # final_name_to_original_map = {}
+                            # for original_name, mapping_info in self.header_mapping.items():
+                            #     if mapping_info.get("include", False):
+                            #         final_name = mapping_info.get("final_name", original_name)
+                            #         if final_name not in final_name_to_original_map:
+                            #             final_name_to_original_map[final_name] = []
+                            #         final_name_to_original_map[final_name].append(original_name)
 
-                            for original_col_name_from_file in df_original.columns:
-                                mapping_info = self.header_mapping.get(original_col_name_from_file)
-                                if mapping_info: # Coluna do arquivo está no mapeamento
-                                    if mapping_info.get("include", False):
-                                        final_name = mapping_info.get("final_name", original_col_name_from_file)
-                                        cols_to_keep_and_their_final_names[original_col_name_from_file] = final_name
-                                else: # Coluna do arquivo NÃO está no mapeamento -> incluir com nome original
-                                    cols_to_keep_and_their_final_names[original_col_name_from_file] = original_col_name_from_file
-                            
-                            if not cols_to_keep_and_their_final_names:
-                                self.log_message.emit(f"Nenhuma coluna selecionada/mapeada para {current_item_description}. Pulando.", LogLevel.WARNING)
-                                processed_items += 1; continue
+                            # 2. Construir as expressões de seleção usando coalesce quando necessário
+                            select_expressions = []
+                            df_original_columns = set(df_original.columns) # Para buscas mais rápidas
 
-                            # Construir expressões de select com alias para renomeação
-                            select_expressions = [
-                                pl.col(orig_name).alias(final_name) 
-                                for orig_name, final_name in cols_to_keep_and_their_final_names.items()
-                                if orig_name in df_original.columns # Garantir que a coluna original existe no df
-                            ]
-                            
-                            if not select_expressions: # Se após filtro, nenhuma coluna do df atual sobrou
+                            for final_name, original_cols_list in final_name_to_source.items():
+                                # Filtrar a lista para incluir apenas as colunas que existem no DataFrame atual
+                                # existing_original_cols = [col for col in original_cols_list if col in df_original_columns]
+                                
+                                # if not existing_original_cols:
+                                #     continue # Nenhuma das colunas de origem para este nome final existe neste arquivo/aba
+
+                                # Se apenas uma coluna de origem existe, faz um alias simples.
+                                # Se mais de uma, usa coalesce para combinar os dados.
+                                if len(original_cols_list) > 1:
+                                    expr = pl.col(original_cols_list).alias(final_name)
+                                else:
+                                    # Coalesce pega o primeiro valor não nulo da lista de colunas
+                                    self.log_message.emit(f"Combinando colunas {original_cols_list} em '{final_name}' para {current_item_description}", LogLevel.INFO)
+                                    expr = pl.coalesce(original_cols_list[0]).alias(final_name)
+                                
+                                select_expressions.append(expr)
+
+                            # Se, após o mapeamento, não sobrar nenhuma expressão, pular o arquivo/aba
+                            if not select_expressions:
                                 self.log_message.emit(f"Nenhuma coluna do arquivo {current_item_description} corresponde ao mapeamento. Pulando.", LogLevel.WARNING)
-                                processed_items +=1; continue
+                                processed_items += 1
+                                continue
 
+                            # 3. Executar a seleção no DataFrame
                             df_intermediate = df_original.select(select_expressions)
                         
                         if df_intermediate.width == 0:
@@ -171,8 +441,118 @@ class ConsolidationWorker(QThread):
                             
                             if casting_expressions: # Se houver alguma expressão (sempre haverá se df_typed não for vazio)
                                 df_typed = df_typed.select(casting_expressions) # .select() é mais seguro que .with_columns() para recriar
+                    
+                        # --- 4. Aplicar Filtros (com lógica hierárquica E/OU) ---
+                        df_filtered = df_typed
+                        if self.filter_rules:
+                            # from collections import defaultdict
+
+                            # Definir quais operadores são para exclusão
+                            EXCLUSION_OPERATORS = {"Diferente de", "Não contém"}
+
+                            grouped_rules = defaultdict(list)
+                            for rule in self.filter_rules:
+                                if rule.get("column"):
+                                    grouped_rules[rule["column"]].append(rule)
+
+                            final_expressions_to_and = []
+                            df_schema = df_filtered.schema
+
+                            for col_name, rules_for_col in grouped_rules.items():
+                                if col_name not in df_schema:
+                                    continue
+
+                                inclusion_exprs = []
+                                exclusion_exprs = []
+                                col_type = df_schema[col_name]
+
+                                # 1. Separar regras em Inclusão e Exclusão
+                                for rule in rules_for_col:
+                                    operator = rule.get("operator")
+                                    value = rule.get("value") # Pega o valor (pode ser string ou lista)
+
+                                    target_list = exclusion_exprs if operator in EXCLUSION_OPERATORS else inclusion_exprs
+
+                                    # Adicionado para pular regras incompletas
+                                    if operator is None or value is None:
+                                        continue
+                                    
+                                    try:
+                                        polars_col = pl.col(col_name)
+                                        expr = None
+                                        
+                                        if operator in OPERATORS_NO_VALUE:
+                                            if operator == "Está em branco": expr = polars_col.is_null()
+                                            elif operator == "Não está em branco": expr = polars_col.is_not_null()
+                                        
+                                        elif operator == "Entre":
+                                            if isinstance(value, list) and len(value) == 2:
+                                                min_val_str, max_val_str = value
+                                                # Strip é aplicado aqui, onde sabemos que são strings
+                                                if min_val_str.strip() and max_val_str.strip():
+                                                    lit_min = pl.lit(min_val_str.strip()).cast(col_type, strict=False)
+                                                    lit_max = pl.lit(max_val_str.strip()).cast(col_type, strict=False)
+                                                    expr = polars_col.is_between(lit_min, lit_max)
+
+                                        # Garante que o valor é uma string antes de usar o .strip()
+                                        elif isinstance(value, str) and value.strip():
+                                            value_str = value.strip()
+                                            lit_val = pl.lit(value_str).cast(col_type, strict=False)
+
+                                            if operator == "Igual a": expr = (polars_col == lit_val)
+                                            elif operator == "Diferente de": expr = (polars_col != lit_val)
+                                            elif operator == "Maior que": expr = (polars_col > lit_val)
+                                            elif operator == "Menor que": expr = (polars_col < lit_val)
+                                            elif col_type == pl.String:
+                                                if operator == "Contém": expr = polars_col.str.contains(value_str, literal=True)
+                                                elif operator == "Não contém": expr = ~polars_col.str.contains(value_str, literal=True)
+                                                elif operator == "Começa com": expr = polars_col.str.starts_with(value_str)
+                                                elif operator == "Termina com": expr = polars_col.str.ends_with(value_str)
+                                        
+                                        if expr is not None:
+                                            target_list.append(expr)
+
+                                    except Exception as e_filter:
+                                        self.log_message.emit(f"Não foi possível aplicar a regra de filtro '{col_name} {operator} {value}': {e_filter}", LogLevel.WARNING)
+                                
+                                # 2. Construir a expressão final para esta coluna
+                                col_final_expr = None
+                                
+                                # Combinar todas as expressões de inclusão com OU (OR)
+                                final_inclusion_expr = pl.any_horizontal(inclusion_exprs) if len(inclusion_exprs) > 1 else (inclusion_exprs[0] if inclusion_exprs else None)
+                                
+                                # Combinar todas as expressões de exclusão com E (AND)
+                                final_exclusion_expr = pl.all_horizontal(exclusion_exprs) if len(exclusion_exprs) > 1 else (exclusion_exprs[0] if exclusion_exprs else None)
+
+                                # Juntar inclusão e exclusão com E (AND)
+                                if final_inclusion_expr is not None and final_exclusion_expr is not None:
+                                    col_final_expr = final_inclusion_expr & final_exclusion_expr
+                                elif final_inclusion_expr is not None:
+                                    col_final_expr = final_inclusion_expr
+                                elif final_exclusion_expr is not None:
+                                    col_final_expr = final_exclusion_expr
+
+                                if col_final_expr is not None:
+                                    final_expressions_to_and.append(col_final_expr)
+
+                            # 3. Aplicar os filtros finais combinados com E (AND)
+                            if final_expressions_to_and:
+                                rows_before = df_filtered.height
+                                df_filtered = df_filtered.filter(final_expressions_to_and)
+                                rows_after = df_filtered.height
+                                self.log_message.emit(f"Filtro aplicado em {current_item_description}. Linhas restantes: {rows_after} de {rows_before}.", LogLevel.INFO)
                         
-                        all_dataframes_processed.append(df_typed)
+                        # --- Fim do Bloco de Filtros ---
+
+                        # --- 3. Adicionar Coluna de Origem --- 
+                        file_name_only = os.path.basename(file_path)
+                        source_name = f"{file_name_only} ({sheet_name})" if sheet_name else file_name_only
+                        
+                        df_final_for_list = df_filtered.with_columns( # <-- Usa df_filtered
+                            pl.lit(source_name).alias("Origem")
+                        )
+
+                        all_dataframes_processed.append(df_final_for_list)
 
                     except Exception as e:
                         self.log_message.emit(f"Erro ao processar (ler/mapear/tipar) {current_item_description}: {e}", LogLevel.ERROR)
@@ -299,15 +679,110 @@ class ConsolidationWorker(QThread):
             self.log_message.emit("Concatenando dados processados...", LogLevel.INFO)
             try:
                 consolidated_df = pl.concat(final_dataframes_to_concat, how="diagonal")
+                # --- Reordenar Coluna "Origem" para o Final ---
+                if "Origem" in consolidated_df.columns:
+                    # Pega todas as colunas, exceto "Origem"
+                    all_other_columns = [col for col in consolidated_df.columns if col != "Origem"]
+                    # Cria a nova ordem com "Origem" no final
+                    new_column_order = all_other_columns + ["Origem"]
+                    # Seleciona as colunas na nova ordem
+                    consolidated_df = consolidated_df.select(new_column_order)
             except Exception as e: 
                  self.log_message.emit(f"Erro concatenação final: {e}", LogLevel.ERROR)
                  self.finished.emit(False, f"Erro concatenação: {e}"); return
+            if self.output_format == "XLSX": 
+                illegal_xml_chars_re = r"[\u0000-\u0008\u000B\u000C\u000E-\u001F]"
+                sanitize_expressions = []
+                for col_name in consolidated_df.columns:
+                    if consolidated_df[col_name].dtype == pl.String:
+                        sanitize_expressions.append(
+                            pl.col(col_name).str.replace_all(illegal_xml_chars_re, "").alias(col_name)
+                        )
+                    else:
+                        sanitize_expressions.append(pl.col(col_name))
+                if sanitize_expressions:
+                    self.log_message.emit("Sanitizando dados para compatibilidade com Excel...", LogLevel.INFO)
+                    consolidated_df = consolidated_df.select(sanitize_expressions)
             
             self.log_message.emit(f"Salvando: {self.output_path}", LogLevel.INFO)
-            if self.output_format == "XLSX": 
-                # consolidated_df = consolidated_df.to_pandas()
-                consolidated_df.write_excel(self.output_path, hide_gridlines = True, sheet_zoom = 70, freeze_panes = (1,0))
-            elif self.output_format == "CSV": consolidated_df.write_csv(self.output_path)
+
+            if self.output_format == "XLSX":
+                try:
+                    import xlsxwriter
+
+                    # ETAPA 1: Otimização de Largura de Coluna
+                    self.log_message.emit("Calculando largura das colunas...", LogLevel.INFO)
+                    max_lengths = {}
+                    for col_name in consolidated_df.columns:
+                        max_len_data = consolidated_df.select(pl.col(col_name).cast(pl.String).str.len_chars().max()).item()
+                        # Garante que a largura mínima seja a do cabeçalho
+                        max_lengths[col_name] = max(len(str(col_name)), max_len_data or 1)
+
+                    # ETAPA 2: Preparação do Workbook e dos Formatos
+                    workbook = xlsxwriter.Workbook(self.output_path, {'use_zip64': True})
+                    header_format = workbook.add_format({'font_name': 'Aptos', 'bold': True, 'font_color': 'white', 'bg_color': '#000000', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
+                    data_format = workbook.add_format({'font_name': 'Aptos'})
+                    
+                    # --- INÍCIO DA LÓGICA DE DIVISÃO EM CHUNKS ---
+                    
+                    max_rows_per_sheet = 1_048_570
+                    dfs_to_write = []
+
+                    if consolidated_df.height > max_rows_per_sheet:
+                        self.log_message.emit(f"DataFrame grande ({consolidated_df.height} linhas), dividindo em múltiplas abas...", LogLevel.INFO)
+                        
+                        num_chunks = (consolidated_df.height + max_rows_per_sheet - 1) // max_rows_per_sheet
+                        
+                        for i in range(num_chunks):
+                            offset = i * max_rows_per_sheet
+                            length = min(max_rows_per_sheet, consolidated_df.height - offset)
+                            
+                            df_chunk = consolidated_df.slice(offset, length)
+                            sheet_name = f"Dados_Parte_{i+1}"
+                            dfs_to_write.append((sheet_name, df_chunk))
+                    else:
+                        # Se não precisar dividir, a lista terá apenas o DataFrame completo
+                        dfs_to_write.append(("Dados", consolidated_df))
+                    
+                    # --- FIM DA LÓGICA DE DIVISÃO EM CHUNKS ---
+
+                    total_rows_written = 0
+                    total_rows_to_write = consolidated_df.height
+                    # ETAPA 3: Escrever cada chunk em sua respectiva aba
+                    for sheet_name, df_chunk in dfs_to_write:
+                        worksheet = workbook.add_worksheet(sheet_name)
+
+                        # Aplicar formatação da planilha
+                        worksheet.freeze_panes('A2')
+                        worksheet.set_zoom(70)
+                        worksheet.hide_gridlines(2)
+
+                        # Escrever o cabeçalho e aplicar o auto-filtro
+                        worksheet.write_row('A1', df_chunk.columns, header_format)
+                        worksheet.autofilter(0, 0, df_chunk.height, df_chunk.width - 1)
+
+                        # Ajustar a largura das colunas
+                        for col_idx, col_name in enumerate(df_chunk.columns):
+                            width = min(max_lengths.get(col_name, len(col_name)) + 2, 60)
+                            worksheet.set_column(col_idx, col_idx, width, data_format) # Aplica a fonte padrão a toda a coluna
+
+                        # Escrever os dados
+                        for r_idx, row_tuple in enumerate(df_chunk.iter_rows(), start=1):
+                            worksheet.write_row(r_idx, 0, row_tuple)
+                            total_rows_written += 1
+                            if total_rows_written % 1000 == 0:
+                                progress_text = f"Escrevendo linha {total_rows_written:,} de {total_rows_to_write:,}..."
+                                self.progress_text_updated.emit(progress_text)
+                        self.progress_text_updated.emit(f"Finalizando escrita de {total_rows_to_write:,} linhas...")
+                    
+                    workbook.close()
+
+                except Exception as e_save_excel:
+                    self.log_message.emit(f"Erro ao salvar arquivo Excel com XlsxWriter: {e_save_excel}", LogLevel.ERROR)
+                    self.finished.emit(False, f"Erro ao salvar Excel: {e_save_excel}")
+                    return
+            elif self.output_format == "CSV": consolidated_df.write_csv(self.output_path, separator = '|')
+            elif self.output_format == "Parquet": consolidated_df.write_parquet(self.output_path, compression = 'zstd')
 
             self.progress_updated.emit(100)
             self.log_message.emit(f"Concluído! Salvo em: {self.output_path}", LogLevel.SUCCESS)
@@ -320,6 +795,219 @@ class ConsolidationWorker(QThread):
     def stop(self): # stop() permanece o mesmo
         self.is_running = False
         self.log_message.emit("Tentativa de parada da consolidação solicitada...", LogLevel.INFO)
+
+class SheetLoadingWorker(QThread):
+    finished = Signal(str, list, str)  # file_path, sheet_names_list, error_message_or_None
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+        self.is_running = True
+
+    def run(self):
+        if not self.is_running:
+            self.finished.emit(self.file_path, [], "Cancelado antes de iniciar.")
+            return
+
+        sheet_names_from_file = []
+        error_message = None
+        try:
+            if not self.is_running: # Checar novamente
+                raise InterruptedError("Carregamento de abas cancelado.")
+
+            if self.file_path.lower().endswith(".xlsx"):
+                # Usar read_only=True para performance, data_only=True para evitar carregar fórmulas complexas se não necessário
+                workbook = openpyxl.load_workbook(self.file_path, read_only=True, data_only=True)
+                sheet_names_from_file = workbook.sheetnames
+                workbook.close() # É bom fechar o workbook
+            elif self.file_path.lower().endswith(".xls"):
+                workbook = xlrd.open_workbook(self.file_path, on_demand=True)
+                sheet_names_from_file = workbook.sheet_names()
+            # Não precisa de else, pois a thread só é chamada para .xlsx/.xls
+        except InterruptedError as ie:
+            error_message = str(ie)
+        except Exception as e:
+            error_message = f"Erro ao ler abas do arquivo {os.path.basename(self.file_path)}: {e}"
+        
+        if self.is_running: # Só emite se não foi cancelado durante a operação
+            self.finished.emit(self.file_path, sheet_names_from_file, error_message)
+
+    def stop(self):
+        self.is_running = False
+
+class SheetAnalysisWorker(QThread):
+    """
+    Worker para analisar todos os arquivos Excel em uma lista e retornar
+    um cache com todas as abas por arquivo e um conjunto de nomes de abas únicos.
+    """
+    # Sinal emite: {cache_de_abas}, {abas_unicas}, mensagem_de_erro
+    finished = Signal(dict, set, str)
+
+    def __init__(self, excel_files_paths):
+        super().__init__()
+        self.excel_files_paths = excel_files_paths
+        self.is_running = True
+
+    def run(self):
+        all_sheets_cache = {} # Ex: {'caminho/arquivo1.xlsx': ['Aba1', 'Aba2'], ...}
+        unique_sheet_names = set()
+        error_message = None
+
+        try:
+            for file_path in self.excel_files_paths:
+                if not self.is_running:
+                    raise InterruptedError("Análise de abas cancelada.")
+                
+                try:
+                    sheet_names = []
+                    # Usamos openpyxl diretamente pois é otimizado para apenas ler nomes de abas
+                    if file_path.lower().endswith(".xlsx"):
+                        workbook = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+                        sheet_names = workbook.sheetnames
+                        workbook.close()
+                    elif file_path.lower().endswith(".xls"):
+                        workbook = xlrd.open_workbook(file_path, on_demand=True)
+                        sheet_names = workbook.sheet_names()
+                    
+                    if sheet_names:
+                        all_sheets_cache[file_path] = sheet_names
+                        unique_sheet_names.update(sheet_names)
+
+                except Exception as e:
+                    # Loga um erro para um arquivo específico mas continua o processo
+                    print(f"AVISO: Não foi possível ler as abas de '{os.path.basename(file_path)}'. Erro: {e}")
+            
+            if self.is_running:
+                self.finished.emit(all_sheets_cache, unique_sheet_names, None)
+
+        except InterruptedError as ie:
+            error_message = str(ie)
+        except Exception as e:
+            error_message = f"Um erro inesperado ocorreu durante a análise de abas: {e}"
+        
+        if error_message:
+            self.finished.emit({}, set(), error_message)
+
+    def stop(self):
+        self.is_running = False
+
+class HeaderAnalysisWorker(QThread):
+    '''Worker para os cabeçalhos'''
+    finished = Signal(list, object)
+    progress_log = Signal(str, LogLevel)
+
+    def __init__(self, files_and_sheets_config, delimiter):
+        super().__init__()
+        self.files_and_sheets_config = files_and_sheets_config
+        self.delimiter = delimiter
+        self.is_running = True
+
+    def _get_series_profile(self, series: pl.Series):
+        non_null_series = series.filter(series.is_not_null() & (series.str.strip_chars() != ""))
+        if non_null_series.is_empty():
+            return {"dtype": pl.String, "null_ratio": series.is_null().mean()}
+        try:
+            if non_null_series.cast(pl.Int64, strict=True).is_not_null().all():
+                return {"dtype": pl.Int64, "null_ratio": series.is_null().mean()}
+        except (Exception, pl.exceptions.PanicException): pass
+        try:
+            if non_null_series.cast(pl.Float64, strict=True).is_not_null().all():
+                return {"dtype": pl.Float64, "null_ratio": series.is_null().mean()}
+        except (Exception, pl.exceptions.PanicException): pass
+        try:
+            if non_null_series.str.to_datetime(strict=True, exact=False, cache=False).is_not_null().all():
+                return {"dtype": pl.Datetime, "null_ratio": series.is_null().mean()}
+        except (Exception, pl.exceptions.PanicException): pass
+        return {"dtype": pl.String, "null_ratio": series.is_null().mean()}
+
+    def run(self):
+        if not self.is_running:
+            self.finished.emit([], InterruptedError("Análise cancelada."))
+            return
+
+        all_column_fingerprints = []
+        n_sample_rows, n_preread_rows = 200, 20
+
+        try:
+            for file_path, selected_sheets in self.files_and_sheets_config:
+                if not self.is_running: raise InterruptedError("Análise cancelada.")
+
+                self.progress_log.emit(f"Analisando: {os.path.basename(file_path)}...", LogLevel.INFO)
+                
+                sheets_to_iterate = selected_sheets if selected_sheets is not None else [None]
+                for sheet_name in sheets_to_iterate:
+                    if not self.is_running: raise InterruptedError("Análise cancelada.")
+                    try:
+                        pre_read_df = None
+                        if file_path.lower().endswith((".csv", ".txt")):
+                            pre_read_df = pl.read_csv(source=file_path, has_header=False, n_rows=n_preread_rows, separator=self.delimiter, encoding='latin-1', ignore_errors=True, infer_schema = False, truncate_ragged_lines = True)
+                        elif file_path.lower().endswith((".xlsx", ".xls")):
+                            pre_read_df = pl.read_excel(source=file_path, sheet_name=sheet_name, has_header = False, infer_schema_length = 0).head(n_preread_rows)
+                        
+                        if pre_read_df is None or pre_read_df.is_empty(): continue
+                        
+                        header_row_index = _find_header_row_index(pre_read_df, n_preread_rows)
+                        header_names = [str(h) if h is not None else f"column_{i}" for i, h in enumerate(pre_read_df.row(header_row_index))]
+                        data_rows_df = pre_read_df.slice(offset=header_row_index + 1).head(n_sample_rows)
+                        
+                        if data_rows_df.is_empty(): continue
+                        
+                        rename_mapping = {old_name: new_name for old_name, new_name in zip(data_rows_df.columns, header_names)}
+                        sample_df = data_rows_df.rename(rename_mapping)
+
+                        for col_name in sample_df.columns:
+                            try: # <-- INÍCIO DO BLOCO DE BLINDAGEM
+                                series = sample_df[col_name]
+                                profile = self._get_series_profile(series)
+                                fingerprint = {
+                                    "source_tuple": (col_name, file_path, sheet_name),
+                                    "normalized_name": _normalize_header_name(col_name),
+                                    "dtype": profile["dtype"],
+                                    "null_ratio": profile["null_ratio"],
+                                }
+                            except Exception as e_profile: # <-- CAPTURA O "PANIC"
+                                # Se a análise da coluna falhar, cria um perfil "seguro"
+                                self.progress_log.emit(f"Falha ao analisar coluna '{col_name}' em '{os.path.basename(file_path)}'. Tratando como texto. Erro: {e_profile}", LogLevel.WARNING)
+                                fingerprint = {
+                                    "source_tuple": (col_name, file_path, sheet_name),
+                                    "normalized_name": _normalize_header_name(col_name),
+                                    "dtype": pl.String, # Tipo de dado seguro
+                                    "null_ratio": 0.0,
+                                }
+                            all_column_fingerprints.append(fingerprint)
+                    except Exception:
+                        continue
+
+            # --- ALGORITMO DE AGRUPAMENTO DEFINITIVO ---
+            groups_by_name = defaultdict(list)
+            for fp in all_column_fingerprints:
+                groups_by_name[fp["normalized_name"]].append(fp)
+            
+            final_groups = []
+            for normalized_name, fp_list in groups_by_name.items():
+                if len(fp_list) == 1:
+                    final_groups.append([fp_list[0]["source_tuple"]])
+                    continue
+
+                sub_groups_by_type = defaultdict(list)
+                for fp in fp_list:
+                    type_key = "numeric" if fp["dtype"].is_numeric() else str(fp["dtype"])
+                    sub_groups_by_type[type_key].append(fp["source_tuple"])
+                
+                for type_key, source_tuples in sub_groups_by_type.items():
+                    final_groups.append(source_tuples)
+
+            if self.is_running:
+                self.finished.emit(final_groups, None)
+        except Exception as e:
+            self.finished.emit([], e)
+
+    def stop(self):
+        self.is_running = False
+
+# Exceção customizada para interrupção
+class InterruptedError(Exception):
+    pass
 
 class PolarsTableModel(QAbstractTableModel):
     def __init__(self, data=None):
@@ -363,151 +1051,433 @@ class PolarsTableModel(QAbstractTableModel):
     def clear_data(self):
         self.load_data(pl.DataFrame())
 
-class HeaderMappingDialog(QDialog):
-    def __init__(self, unique_headers, parent=None, existing_mapping=None):
+class SplitGroupDialog(QDialog):
+    """Um diálogo para dividir um grupo de cabeçalhos."""
+    def __init__(self, group_to_split, parent = None):
         super().__init__(parent)
-        self.setWindowTitle("Mapeamento e Tipagem de Cabeçalhos")
-        self.setMinimumSize(750, 450) # Aumentar um pouco para a nova coluna
+        self.setWindowTitle("Dividir Grupo de Cabeçalhos")
+        self.setMinimumWidth(500)
+        self.layout = QVBoxLayout(self)
+        self.layout.addWidget(QLabel("Marque os cabeçalhos que você deseja mover para um novo grupo:"))
+        self.list_widget = QListWidget()
+        for original_name, file_path, sheet_name in group_to_split:
+            # Formata o texto do item para ser informativo
+            source_text = os.path.basename(file_path)
+            if sheet_name:
+                source_text += f" ({sheet_name})"
+            item_text = f"'{original_name}' (Fonte: {source_text})"
+            list_item = QListWidgetItem(item_text)
+            list_item.setFlags(list_item.flags() | Qt.ItemIsUserCheckable)
+            list_item.setCheckState(Qt.Unchecked)
+            # Armazena a tupla original no item para referência posterior
+            list_item.setData(Qt.UserRole, (original_name, file_path, sheet_name))
+            self.list_widget.addItem(list_item)
+        self.layout.addWidget(self.list_widget)
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        self.layout.addWidget(button_box)
+    
+    def get_selected_to_split(self):
+        """Retorna uma lista das tuplas de origem que foram marcadas
+        para serem divididas."""
+        to_split = []
+        # all_items = self.list_widget.findItems("*", Qt.MatchWildcard)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            is_checked = (item.checkState() == Qt.Checked)
+            # print(f"Item {i} ('{item.text()}'): Marcado? {is_checked}")
+            # if item.checkState() == Qt.Checked:
+            if is_checked:
+                to_split.append(item.data(Qt.UserRole))
+            # print(f"--- DEBUG: Itens que serão retornados para divisão: {to_split} ---\n")
+        return to_split
 
-        self.unique_headers = sorted(list(unique_headers))
-        self.mapping = existing_mapping if existing_mapping is not None else {}
+class HeaderMappingDialog(QDialog):
+    def __init__(self, suggested_groups, parent=None, existing_mapping=None):
+        super().__init__(parent)
+        self.setWindowTitle("Mapeamento e Agrupamento de Cabeçalhos")
+        self.setMinimumSize(850, 600)
 
+        self.groups = suggested_groups
+        # O existing_mapping pode ser usado no futuro para pré-preencher, por enquanto simplificamos
+        
         layout = QVBoxLayout(self)
         description_label = QLabel(
-            "Ajuste os nomes finais, selecione a inclusão e defina o tipo de dados para cada coluna."
+            "O algoritmo sugeriu os grupos abaixo. Confirme, divida ou mescle os grupos e defina o mapeamento final."
         )
         layout.addWidget(description_label)
 
+        # --- Layout para botões de ação (Dividir/Mesclar) ---
+        actions_layout = QHBoxLayout()
+        self.split_group_button = QPushButton("Dividir Grupo Selecionado...")
+        self.split_group_button.clicked.connect(self.split_selected_group)
+        self.merge_groups_button = QPushButton("Mesclar Grupos Selecionados")
+        self.merge_groups_button.clicked.connect(self.merge_selected_groups)
+        
+        actions_layout.addWidget(self.split_group_button)
+        actions_layout.addWidget(self.merge_groups_button)
+        actions_layout.addStretch()
+        layout.addLayout(actions_layout)
+
+        # --- Tabela Principal ---
         self.table_widget = QTableWidget()
         self.table_widget.setColumnCount(4)
-        self.table_widget.setHorizontalHeaderLabels(["Cabeçalho Original", "Cabeçalho Final", 'Tipo de Dados', "Incluir?"])
-        self.table_widget.setRowCount(len(self.unique_headers))
+        self.table_widget.setHorizontalHeaderLabels(["Grupo Sugerido / Cabeçalho", "Cabeçalho Final", 'Tipo de Dados', "Incluir?"])
+        self.table_widget.setSelectionMode(QAbstractItemView.ExtendedSelection) # Permite selecionar múltiplas linhas
+        
+        self.populate_table() # Popula a tabela com os grupos iniciais
 
-        for row, header_original in enumerate(self.unique_headers):
-            # Cabeçalho Original (não editável)
-            item_original = QTableWidgetItem(header_original)
-            item_original.setFlags(item_original.flags() & ~Qt.ItemIsEditable) # Remove flag de edição
-            self.table_widget.setItem(row, 0, item_original)
-
-            # Cabeçalho Final (QLineEdit)
-            final_name_edit = QLineEdit()
-            # Pré-preencher com mapeamento existente ou com o original
-            final_name = self.mapping.get(header_original, {}).get("final_name", header_original)
-            final_name_edit.setText(final_name)
-            self.table_widget.setCellWidget(row, 1, final_name_edit)
-
-            # Tipo de Dados (QComboBox) <--- NOVA COLUNA
-            type_combo = QComboBox()
-            type_combo.addItems(DATA_TYPES_OPTIONS)
-            saved_type_str = self.mapping.get(header_original, {}).get("type_str", DATA_TYPES_OPTIONS[0]) # Default "Automático/String"
-            if saved_type_str in DATA_TYPES_OPTIONS:
-                type_combo.setCurrentText(saved_type_str)
-            else: # Se o tipo salvo não for válido, default para o primeiro
-                 type_combo.setCurrentIndex(0)
-            self.table_widget.setCellWidget(row, 2, type_combo)
-
-            # Incluir? (QCheckBox)
-            checkbox_widget = QWidget() # Widget para centralizar o checkbox
-            checkbox_layout = QHBoxLayout(checkbox_widget)
-            checkbox = QCheckBox()
-            checkbox_layout.addWidget(checkbox)
-            checkbox_layout.setAlignment(Qt.AlignCenter)
-            checkbox_layout.setContentsMargins(0,0,0,0)
-            checkbox_widget.setLayout(checkbox_layout)
-            
-            # Pré-preencher com mapeamento existente ou True por padrão
-            is_included = self.mapping.get(header_original, {}).get("include", True)
-            checkbox.setChecked(is_included)
-            self.table_widget.setCellWidget(row, 3, checkbox_widget)
-            
-        self.table_widget.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table_widget.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table_widget.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table_widget.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table_widget.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents) 
+        self.table_widget.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         layout.addWidget(self.table_widget)
-
-        header_actions_layout = QHBoxLayout()
-        self.include_all_headers_button = QPushButton("Incluir Todos")
-        self.include_all_headers_button.clicked.connect(self.include_all_headers)
-        self.exclude_all_headers_button = QPushButton("Excluir Todos")
-        self.exclude_all_headers_button.clicked.connect(self.exclude_all_headers)
-        header_actions_layout.addWidget(self.include_all_headers_button)
-        header_actions_layout.addWidget(self.exclude_all_headers_button)
-        header_actions_layout.addStretch()
-        layout.addLayout(header_actions_layout)
 
         # Botões OK e Cancelar
         self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
-    
-    def include_all_headers(self):
-        self._set_all_headers_include_state(True)
-    
-    def exclude_all_headers(self):
-        self._set_all_headers_include_state(False)
-    
-    def _set_all_headers_include_state(self, checked):
-        for row in range(self.table_widget.rowCount()):
-            checkbox_widget_container = self.table_widget.cellWidget(row, 3)
-            if checkbox_widget_container:
-                checkbox = checkbox_widget_container.layout().itemAt(0).widget()
-                if isinstance(checkbox, QCheckBox):
-                    checkbox.setChecked(checked)
+
+    def populate_table(self):
+        """Limpa e preenche a tabela com base na lista self.groups atual."""
+        self.table_widget.setRowCount(0) # Limpa a tabela
+        self.table_widget.setRowCount(len(self.groups))
+
+        for row, group_list in enumerate(self.groups):
+            # group_list é uma lista de tuplas de origem, ex: [('CNPJ', 'f1', 's1'), ...]
+            
+            # Coluna 0: Representação do Grupo
+            # Usa o primeiro nome original do grupo como nome de exibição
+            display_name = group_list[0][0]
+            item_group = QTableWidgetItem(display_name)
+            item_group.setFlags(item_group.flags() & ~Qt.ItemIsEditable)
+            
+            # Cria o texto do tooltip para mostrar todos os membros do grupo
+            tooltip_text = "Membros do grupo:\n" + "\n".join(
+                f"- '{orig_name}' (em {os.path.basename(path)}{f' | {s_name}' if s_name else ''})"
+                for orig_name, path, s_name in group_list
+            )
+            item_group.setToolTip(tooltip_text)
+            item_group.setData(Qt.UserRole, group_list) # Armazena os dados do grupo no item
+            self.table_widget.setItem(row, 0, item_group)
+
+            # Coluna 1: Cabeçalho Final (QLineEdit)
+            final_name_edit = QLineEdit(display_name) # Sugere o nome do grupo como nome final
+            self.table_widget.setCellWidget(row, 1, final_name_edit)
+
+            # Coluna 2: Tipo de Dados (QComboBox)
+            type_combo = QComboBox()
+            type_combo.addItems(DATA_TYPES_OPTIONS)
+            self.table_widget.setCellWidget(row, 2, type_combo)
+
+            # Coluna 3: Incluir? (QCheckBox)
+            checkbox, checkbox_widget = self._create_checkbox()
+            checkbox.setChecked(True) # Incluir por padrão
+            self.table_widget.setCellWidget(row, 3, checkbox_widget)
+
+    def _create_checkbox(self):
+        """Helper para criar um QCheckBox centralizado dentro de um widget."""
+        checkbox_widget = QWidget()
+        checkbox_layout = QHBoxLayout(checkbox_widget)
+        checkbox = QCheckBox()
+        checkbox_layout.addWidget(checkbox)
+        checkbox_layout.setAlignment(Qt.AlignCenter)
+        checkbox_layout.setContentsMargins(0, 0, 0, 0)
+        return checkbox, checkbox_widget
+
+    def split_selected_group(self):
+        """Abre o diálogo para dividir o grupo atualmente selecionado."""
+        selected_rows = sorted(list(set(index.row() for index in self.table_widget.selectedIndexes())))
+        if len(selected_rows) != 1:
+            # Informar o usuário que apenas um grupo pode ser dividido por vez
+            return
+
+        row_to_split = selected_rows[0]
+        group_item = self.table_widget.item(row_to_split, 0)
+        group_data = group_item.data(Qt.UserRole)
+        # print(f"DEBUG - Grupo para Dividir: {group_data}")
+
+        if len(group_data) < 2: # Não pode dividir um grupo de 1
+            return
+
+        split_dialog = SplitGroupDialog(group_data, self)
+        if split_dialog.exec() == QDialog.Accepted:
+            items_to_move = split_dialog.get_selected_to_split()
+            if not items_to_move: return
+
+            # Atualizar self.groups: remover os itens do grupo antigo e criar um novo
+            new_group = items_to_move
+            self.groups.append(new_group)
+            
+            # Lista atualizada do grupo antigo
+            updated_old_group = [item for item in group_data if item not in items_to_move]
+            
+            if not updated_old_group: # Se todos os itens foram movidos
+                self.groups.pop(self.groups.index(group_data))
+            else:
+                self.groups[self.groups.index(group_data)] = updated_old_group
+            
+            self.populate_table() # Redesenha a tabela com os grupos atualizados
+
+    def merge_selected_groups(self):
+        """Mescla duas ou mais linhas (grupos) selecionadas em uma só."""
+        selected_rows = sorted(list(set(index.row() for index in self.table_widget.selectedIndexes())), reverse=True)
+        if len(selected_rows) < 2:
+            # Informar o usuário que precisa selecionar pelo menos 2 grupos para mesclar
+            return
+
+        new_merged_group = []
+        groups_to_remove = []
+        for row in selected_rows:
+            group_data = self.table_widget.item(row, 0).data(Qt.UserRole)
+            new_merged_group.extend(group_data)
+            groups_to_remove.append(group_data)
+        
+        # Remover os grupos antigos e adicionar o novo grupo mesclado
+        for group in groups_to_remove:
+            self.groups.remove(group)
+        self.groups.insert(0, new_merged_group) # Adiciona no topo para fácil visualização
+
+        self.populate_table() # Redesenha a tabela
 
     def get_mapping(self):
-        """Retorna o mapeamento definido pelo usuário."""
-        updated_mapping = {}
+        """Lê a tabela e retorna o dicionário de mapeamento final."""
+        final_mapping = {}
         for row in range(self.table_widget.rowCount()):
-            original_header_item = self.table_widget.item(row, 0)
-            if not original_header_item: continue # Segurança se o item não existir
-            original_header = original_header_item.text()
+            # Obter os dados do grupo armazenados no item da Coluna 0
+            group_data = self.table_widget.item(row, 0).data(Qt.UserRole)
 
-            final_name_widget = self.table_widget.cellWidget(row, 1) # Pega o QLineEdit
-            final_name = original_header # Default
-            if isinstance(final_name_widget, QLineEdit): # Verifica se realmente é um QLineEdit
-                final_name = final_name_widget.text().strip()
+            if not group_data:
+                continue
             
-            type_combo_widget = self.table_widget.cellWidget(row, 2) # <--- LER O COMBOBOX
-            selected_type_str = DATA_TYPES_OPTIONS[0] # Default
-            if isinstance(type_combo_widget, QComboBox):
-                selected_type_str = type_combo_widget.currentText()
+            # Obter as configurações definidas pelo usuário para este grupo
+            final_name = self.table_widget.cellWidget(row, 1).text().strip()
+            type_str = self.table_widget.cellWidget(row, 2).currentText()
+            include = self.table_widget.cellWidget(row, 3).layout().itemAt(0).widget().isChecked()
+
+            if not final_name: # Fallback se o nome final for deixado em branco
+                final_name = self.table_widget.item(row, 0).text()
+
+            # "Desdobra" o grupo, aplicando a mesma regra a todos os seus membros
+            # for original_name, _, _ in group_data:
+            for source_tuple in group_data:
+                final_mapping[source_tuple] = {
+                    "final_name": final_name,
+                    "type_str": type_str,
+                    "include": include
+                }
+        return final_mapping
+
+class HelpDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Guia do Usuário - DataFlow Delivery Center")
+        self.setMinimumSize(800, 600)
+
+        # --- Estrutura do Conteúdo da Ajuda ---
+        # Chave: Título do Tópico, Valor: Conteúdo em HTML
+        self.help_content = {
+            "Visão Geral": """
+                <h1>Bem-vindo ao DataFlow!</h1>
+                <p>Esta ferramenta foi projetada para automatizar o processo de unificar múltiplos arquivos
+                (Excel, CSV, TXT) em um único arquivo de saída, realizando limpeza e transformações inteligentes no processo.</p>
+                <p>Navegue pelos tópicos à esquerda para aprender sobre cada funcionalidade.</p>
+            """,
+            "1. Seleção e Leitura": """
+                <h2>1. Seleção de Pasta e Opções de Leitura</h2>
+                <p><b>Selecionar Pasta:</b> O primeiro passo é sempre selecionar a pasta onde seus arquivos de dados estão localizados.</p>
+                <p><b>Atualizar Pasta:</b> Se você adicionar ou remover arquivos da pasta com o programa aberto, ou também alterar o delimitador, clique no botão 'Atualizar' (com o ícone de recarregar) para que a lista de arquivos e delimitador sejam atualizados.</p>
+                <p><b>Delimitador:</b> Para arquivos <b>.CSV</b> e <b>.TXT</b>, é crucial escolher o caractere que separa as colunas (delimitador). As opções mais comuns estão disponíveis, ou você pode especificar um customizado em 'Outro...'.</p>
+                <br>
+                <h3>Detecção Automática de Cabeçalho</h3>
+                <p>A ferramenta detecta automaticamente em qual linha o cabeçalho se encontra, ignorando títulos ou linhas em branco no topo dos arquivos. Isso funciona tanto na pré-visualização quanto na consolidação final.</p>
+                <p><img src="app/ex_preview.png" width = "600" height = "300"></p>
+            """,
+            "2. Mapeamento de Cabeçalhos": """
+                <h2>2. Mapeamento e Agrupamento Inteligente</h2>
+                <p>Esta é a etapa mais poderosa da ferramenta.</p>
+                <p><b>Análise Inteligente:</b> Ao clicar em 'Analisar/Mapear Cabeçalhos', o programa lê uma amostra de cada arquivo e cria uma "impressão digital" de cada coluna, analisando não apenas o nome, mas também o tipo de dado do conteúdo.</p>
+                <p><b>Grupos Sugeridos:</b> Com base nessa análise, ele agrupa automaticamente colunas que parecem ser a mesma coisa, mesmo que tenham nomes diferentes (ex: 'CNPJ' e 'C.N.P.J.').</p>
+                <p><b>Tooltip de Detalhes:</b> Passe o mouse sobre um nome na coluna 'Grupo Sugerido' para ver todas as variações originais que foram agrupadas ali.</p>
+                <p><b>Sua Supervisão:</b> Você tem o controle final! Use os botões <b>'Dividir Grupo'</b> para separar colunas agrupadas incorretamente, e <b>'Mesclar Grupos'</b> para unir grupos que você sabe que são a mesma coisa.</p>
+                <p><img src="app/ex_header.png" width = "500" height = "400"></p>
+            """,
+            "3. Filtros de Dados": """
+                <h2>3. Filtros de Dados</h2>
+                <p>A funcionalidade de filtro permite refinar os dados que serão incluídos na consolidação final.</p>
+                <p><b>Lógica E / OU:</b> O sistema aplica uma lógica inteligente:</p>
+                <ul>
+                    <li>Regras para a <b>mesma coluna</b> são combinadas com <b>OU</b> (ex: `Nome = "João" OU Nome = "Maria"`).</li>
+                    <li>Regras para <b>colunas diferentes</b> são combinadas com <b>E</b> (ex: `(Nome = "João") E (Status = "Ativo")`).</li>
+                    <li>Regras de exclusão ('Não contém', 'Diferente de') são aplicadas após as de inclusão.</li>
+                </ul>
+                <p>Isso permite criar filtros complexos, como 'incluir todas as Compras e Vendas, mas não incluir as que forem Vendas de Ativos'.</p>
+                <p><img src="app/ex_filter.png" width = "500" height = "400"></p>
+            """,
+            "4. Consolidação e Saída": """
+                <h2>4. Consolidação e Arquivo Final</h2>
+                <p>Após definir o mapeamento e os filtros, escolha o local e o formato de saída (XLSX ou CSV) e clique em 'Iniciar Consolidação'.</p>
+                <h3>Recursos da Saída em Excel</h3>
+                <ul>
+                    <li><b>Coluna 'Origem':</b> Uma coluna extra é adicionada ao final, indicando de qual arquivo e aba cada linha de dado veio.</li>
+                    <li><b>Estilo Profissional:</b> O cabeçalho é formatado com um fundo escuro e texto claro.</li>
+                    <li><b>Múltiplas Abas:</b> Se o resultado tiver mais de ~1 milhão de linhas, ele será automaticamente dividido em múltiplas abas ('Dados_Parte_1', 'Dados_Parte_2', etc.).</li>
+                    <li><b>Formatação Adicional:</b> A planilha vem com painéis congelados, zoom ajustado e sem linhas de grade para uma melhor visualização.</li>
+                </ul>
+            """,
+        }
+
+        # --- Layout da Janela ---
+        layout = QHBoxLayout(self)
+
+        # Painel esquerdo com os tópicos
+        self.topics_list = QListWidget()
+        self.topics_list.setMaximumWidth(200)
+        self.topics_list.addItems(self.help_content.keys())
+        
+        # Painel direito para exibir o conteúdo
+        self.content_display = QTextEdit()
+        self.content_display.setReadOnly(True)
+
+        layout.addWidget(self.topics_list)
+        layout.addWidget(self.content_display)
+        
+        # Conectar a seleção de tópico à exibição de conteúdo
+        self.topics_list.currentItemChanged.connect(self.display_topic_content)
+        # Selecionar o primeiro item por padrão
+        self.topics_list.setCurrentRow(0)
+
+    def display_topic_content(self, current_item, previous_item):
+        """Exibe o conteúdo HTML do tópico selecionado."""
+        if current_item:
+            topic = current_item.text()
+            self.content_display.setHtml(self.help_content.get(topic, "<p>Tópico não encontrado.</p>"))
+
+class SheetSelectionDialog(QDialog):
+    """Diálogo para seleção global de abas."""
+    def __init__(self, unique_sheet_names, existing_rules=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Seleção Global de Abas")
+        self.setMinimumSize(500, 450)
+
+        layout = QVBoxLayout(self)
+        
+        # --- Modo de Seleção (Incluir vs Excluir) ---
+        mode_box = QGroupBox("Modo de Operação")
+        mode_layout = QVBoxLayout()
+        self.include_radio = QRadioButton("Incluir APENAS as abas marcadas abaixo")
+        self.exclude_radio = QRadioButton("Excluir TODAS as abas marcadas abaixo")
+        mode_layout.addWidget(self.include_radio)
+        mode_layout.addWidget(self.exclude_radio)
+        mode_box.setLayout(mode_layout)
+        layout.addWidget(mode_box)
+        
+        # --- Lista de Abas ---
+        list_box = QGroupBox("Abas Encontradas em Todos os Arquivos")
+        list_layout = QVBoxLayout()
+        
+        self.list_widget = QListWidget()
+        for name in sorted(list(unique_sheet_names)):
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.list_widget.addItem(item)
+        
+        list_layout.addWidget(self.list_widget)
+
+        # Botões de ação para a lista
+        list_actions_layout = QHBoxLayout()
+        mark_all_button = QPushButton("Marcar Todos")
+        unmark_all_button = QPushButton("Desmarcar Todos")
+        list_actions_layout.addStretch()
+        list_actions_layout.addWidget(mark_all_button)
+        list_actions_layout.addWidget(unmark_all_button)
+        list_layout.addLayout(list_actions_layout)
+        
+        list_box.setLayout(list_layout)
+        layout.addWidget(list_box)
+
+        # --- Botões OK e Cancelar ---
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Reset)
+        button_box.button(QDialogButtonBox.Reset).setText("Limpar Regras")
+        layout.addWidget(button_box)
+
+        # --- Conectar Sinais ---
+        mark_all_button.clicked.connect(lambda: self._set_all_check_state(Qt.Checked))
+        unmark_all_button.clicked.connect(lambda: self._set_all_check_state(Qt.Unchecked))
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        button_box.button(QDialogButtonBox.Reset).clicked.connect(self.clear_rules)
+
+        # --- Carregar regras existentes ---
+        if existing_rules and existing_rules.get("names"):
+            if existing_rules.get("mode") == "exclude":
+                self.exclude_radio.setChecked(True)
+            else:
+                self.include_radio.setChecked(True)
             
-            checkbox_widget_container = self.table_widget.cellWidget(row, 3) # Pega o QWidget container
-            include = True # Default
-            if checkbox_widget_container:
-                # Encontrar o QCheckBox dentro do layout do QWidget container
-                layout = checkbox_widget_container.layout()
-                if layout and layout.count() > 0:
-                    checkbox = layout.itemAt(0).widget()
-                    if isinstance(checkbox, QCheckBox): # Verifica se é um QCheckBox
-                        include = checkbox.isChecked()
+            for i in range(self.list_widget.count()):
+                item = self.list_widget.item(i)
+                if item.text() in existing_rules["names"]:
+                    item.setCheckState(Qt.Checked)
+        else:
+            # Estado padrão
+            self.include_radio.setChecked(True)
 
-            # Se o usuário apagar o nome final, usar o original como fallback
-            if not final_name: 
-                final_name = original_header
-                # Opcional: resetar o QLineEdit para o nome original se estiver vazio?
-                # if isinstance(final_name_widget, QLineEdit):
-                #     final_name_widget.setText(final_name)
+    def _set_all_check_state(self, state):
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setCheckState(state)
 
-            updated_mapping[original_header] = {
-                "final_name": final_name,
-                "type_str": selected_type_str, # Armazenar a string do tipo
-                "include": include
-            }
-        return updated_mapping
+    def clear_rules(self):
+        """Limpa a seleção e reseta para o modo padrão."""
+        self.include_radio.setChecked(True)
+        self._set_all_check_state(Qt.Unchecked)
+        # Opcional: pode fechar o diálogo ou apenas limpar a tela.
+        # Por enquanto, apenas limpa a seleção.
+
+    def get_rules(self):
+        """Retorna as regras definidas pelo usuário."""
+        mode = "exclude" if self.exclude_radio.isChecked() else "include"
+        selected_names = set()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                selected_names.add(item.text())
+        
+        # Se nenhuma aba for marcada, retorna uma regra vazia para desativar o filtro global
+        if not selected_names:
+            return {}
+            
+        return {"mode": mode, "names": selected_names}
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.setWindowIcon(QIcon("app/logo1.png"))
         self.header_mapping = {}
-        self.setWindowTitle("Consolidador de Arquivos Super Poderoso")
+        self.filter_rules = []
+        self.sheet_selection_rules = {}
+        self.all_sheets_cache = {}
+        menu_bar = self.menuBar()
+        
+        # Menu "Ajuda"
+        help_menu = menu_bar.addMenu("&Ajuda") # O & cria um atalho (Alt+A)
+        
+        guide_action = QAction("Guia do Usuário...", self)
+        guide_action.triggered.connect(self.open_help_dialog)
+        help_menu.addAction(guide_action)
+        self.setWindowTitle("DataFlow Delivery Center")
         self.setGeometry(100, 100, 1000, 750) 
 
         self.current_files_paths = {}
         self.output_file_path = "" 
         self.consolidation_thread = None
+        self.sheet_loader_thread = None
+        self.header_analyzer_thread = None
+        self.sheet_analysis_worker = None
+        self.is_last_log_progress = False
         self.sheet_selections = {} 
         self.last_used_input_folder = self._load_last_input_folder() # <--- CARREGAR AO INICIAR
 
@@ -517,6 +1487,12 @@ class MainWindow(QMainWindow):
 
         # --- 1. Seção de Seleção de Pasta ---
         folder_selection_layout = QHBoxLayout()
+        # logo_label = QLabel()
+        # pixmap = QPixmap("app/logo.png")
+        # logo_label.setPixmap(pixmap.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        logo_widget = QSvgWidget("app/logo2.svg")
+        logo_widget.setFixedSize(250, 48)
+        folder_selection_layout.addWidget(logo_widget)
         self.folder_path_label = QLabel("Pasta do Projeto:")
         self.folder_path_line_edit = QLineEdit()
         self.folder_path_line_edit.setReadOnly(True)
@@ -529,22 +1505,64 @@ class MainWindow(QMainWindow):
         self.select_folder_button = QPushButton("Selecionar Pasta...")
         self.select_folder_button.clicked.connect(self.open_folder_dialog)
 
+        # BOTÃO para atualizar
+        self.refresh_button = QPushButton("Atualizar")
+        refresh_icon = self.style().standardIcon(QStyle.SP_BrowserReload)
+        self.refresh_button.setIcon(refresh_icon)
+        self.refresh_button.clicked.connect(self.refresh_folder_list)
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setToolTip("Atualiza a lista de arquivos da pasta selecionada.")
+
         # BOTÃO para mapear cabeçalhos
         self.map_headers_button = QPushButton("Analisar/Mapear Cabeçalhos")
+        self.define_filters_button = QPushButton("Definir Filtros")
+        self.define_filters_button.clicked.connect(self.open_filter_dialog)
+        self.define_filters_button.setEnabled(False) # Habilitar somente após mapeamento de cabeçalho
         self.map_headers_button.clicked.connect(self.open_header_mapping_dialog)
         self.map_headers_button.setEnabled(False) # Habilitar após selecionar pasta 
+        
+        self.sheet_selection_button = QPushButton("Seleção de Abas...")
+        self.sheet_selection_button.clicked.connect(self.open_sheet_selection_dialog)
+        self.sheet_selection_button.setEnabled(False) # Começa desabilitado
+        self.sheet_selection_button.setToolTip("Defina regras globais para incluir ou excluir abas em todos os arquivos Excel.")
         
         folder_selection_layout.addWidget(self.folder_path_label)
         folder_selection_layout.addWidget(self.folder_path_line_edit)
         folder_selection_layout.addWidget(self.select_folder_button)
+        folder_selection_layout.addWidget(self.refresh_button)
         folder_selection_layout.addWidget(self.map_headers_button)
+        folder_selection_layout.addWidget(self.define_filters_button)
+        folder_selection_layout.addWidget(self.sheet_selection_button)
         main_layout.addLayout(folder_selection_layout)
+        # --- Opções de Leitura ---
+        self.options_group_box = QGroupBox("Opções de Leitura para .CSV e .TXT")
+        options_layout = QHBoxLayout()
+        delimiter_label = QLabel("Delimitador: ")
+        self.delimiter_combo = QComboBox()
+        self.delimiter_combo.addItems([
+            "Ponto e Vírgula (;)",
+            "Vírgula (,)",
+            "Tabulação (Tab)",
+            "Pipe (|)",
+            "Outro..."
+        ])
+        self.delimiter_custom_edit = QLineEdit()
+        self.delimiter_custom_edit.setPlaceholderText("Digite o delimitador")
+        self.delimiter_custom_edit.setFixedWidth(120)
+        self.delimiter_custom_edit.setVisible(False) # Começa oculto
+        self.delimiter_combo.currentTextChanged.connect(self._on_delimiter_changed)
+        options_layout.addWidget(delimiter_label)
+        options_layout.addWidget(self.delimiter_combo)
+        options_layout.addWidget(self.delimiter_custom_edit)
+        options_layout.addStretch() # Empurra tudo para a esquerda
+        self.options_group_box.setLayout(options_layout)
+        main_layout.addWidget(self.options_group_box)
 
         # --- 2. Seção Intermediária (Arquivos/Abas e Console) ---
         middle_section_layout = QHBoxLayout()
         left_panel_layout = QVBoxLayout()
         
-        self.files_label = QLabel("Arquivos Encontrados (.xlsx, .csv, .xls):")
+        self.files_label = QLabel("Arquivos Encontrados (.xlsx, .csv, .xls, .txt):")
         self.files_list_widget = QListWidget()
         self.files_list_widget.currentItemChanged.connect(self.on_file_selected_for_preview)
         
@@ -554,8 +1572,6 @@ class MainWindow(QMainWindow):
         # Conectar o sinal itemChanged para quando o estado de um checkbox de aba mudar
         self.sheets_list_widget.itemChanged.connect(self.on_sheet_selection_changed)
         self.sheets_list_widget.currentItemChanged.connect(self.on_sheet_list_item_selected_for_preview)
-
-
 
         left_panel_layout.addWidget(self.files_label)
         left_panel_layout.addWidget(self.files_list_widget)
@@ -614,7 +1630,7 @@ class MainWindow(QMainWindow):
         
         self.output_format_label = QLabel("Formato:")
         self.output_format_combo_box = QComboBox()
-        self.output_format_combo_box.addItems(["XLSX", "CSV"])
+        self.output_format_combo_box.addItems(["XLSX", "CSV", "Parquet"])
         self.output_format_combo_box.currentTextChanged.connect(self.update_output_filename_extension)
         
         self.save_as_button = QPushButton("Salvar Como...")
@@ -633,7 +1649,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
 
+        # self.progress_text_label = QLabel("")
+        # self.progress_text_label.setAlignment(Qt.AlignCenter)
+        # self.progress_text_label.setVisible(False)
+
         self.consolidate_button = QPushButton("Iniciar Consolidação")
+        self.consolidate_button.setObjectName("consolidate_button")
         self.consolidate_button.clicked.connect(self.start_consolidation) 
 
         self.cancel_button = QPushButton("Cancelar")
@@ -644,6 +1665,7 @@ class MainWindow(QMainWindow):
         buttons_layout.addWidget(self.consolidate_button)
         buttons_layout.addWidget(self.cancel_button)
         
+        # action_progress_layout.addWidget(self.progress_text_label)
         action_progress_layout.addWidget(self.progress_bar)
         action_progress_layout.addLayout(buttons_layout) 
         main_layout.addLayout(action_progress_layout)
@@ -652,6 +1674,84 @@ class MainWindow(QMainWindow):
         self.show()
         self.log_message("Aplicação iniciada. Selecione uma pasta para começar.", LogLevel.INFO)
         self.update_output_filename_extension(self.output_format_combo_box.currentText())
+    
+    def open_sheet_selection_dialog(self):
+        """Inicia a análise de todas as abas em uma thread e abre o diálogo de seleção ao concluir."""
+        if self.sheet_analysis_worker and self.sheet_analysis_worker.isRunning():
+            self.log_message("A análise de abas já está em andamento.", LogLevel.INFO)
+            return
+
+        excel_files = [path for path in self.current_files_paths.values() if path.lower().endswith((".xlsx", ".xls"))]
+        if not excel_files:
+            self.log_message("Nenhum arquivo Excel encontrado na pasta para analisar as abas.", LogLevel.WARNING)
+            return
+
+        self.log_message("Analisando nomes de todas as abas dos arquivos Excel (em segundo plano)...", LogLevel.INFO)
+        self.sheet_selection_button.setEnabled(False) # Desabilita durante a análise
+
+        self.sheet_analysis_worker = SheetAnalysisWorker(excel_files)
+        self.sheet_analysis_worker.finished.connect(self.on_sheet_analysis_finished)
+        self.sheet_analysis_worker.start()
+
+    def on_sheet_analysis_finished(self, all_sheets_cache, unique_sheet_names, error_message):
+        """Chamado quando a SheetAnalysisWorker termina."""
+        self.sheet_selection_button.setEnabled(True) # Reabilita o botão
+        self.sheet_analysis_worker = None
+
+        if error_message:
+            self.log_message(f"Erro durante a análise de abas: {error_message}", LogLevel.ERROR)
+            return
+
+        self.log_message(f"Análise de abas concluída. {len(unique_sheet_names)} nomes de abas únicos encontrados.", LogLevel.SUCCESS)
+        self.all_sheets_cache = all_sheets_cache # Salva o cache para uso posterior
+
+        # Abre o diálogo com as abas encontradas e as regras que já possam existir
+        dialog = SheetSelectionDialog(unique_sheet_names, self.sheet_selection_rules, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.sheet_selection_rules = dialog.get_rules()
+            if self.sheet_selection_rules:
+                self.log_message(f"Regra de seleção de abas definida. Modo: {self.sheet_selection_rules['mode']}.", LogLevel.SUCCESS)
+            else:
+                self.log_message("Regras de seleção global de abas foram limpas.", LogLevel.INFO)
+
+    def open_help_dialog(self):
+        """Cria e exibe a janela de ajuda/guia do usuário."""
+        # O diálogo já tem o texto, não precisamos passar nada.
+        # Passamos 'self' para que o diálogo seja "filho" da janela principal.
+        dialog = HelpDialog(self)
+        dialog.exec() # .exec() abre o diálogo de forma moda
+    
+    def _on_delimiter_changed(self, text):
+        is_custom = (text == "Outro...")
+        self.delimiter_custom_edit.setVisible(is_custom)
+    
+    def refresh_folder_list(self):
+        """Recarrega a lista de arquivos da pasta
+        atualmente exibida."""
+        current_folder = self.folder_path_line_edit.text()
+        if not os.path.isdir(current_folder):
+            self.log_message("Nenhuma pasta válida selecionada para atualizar.", LogLevel.WARNING)
+            return
+        self.log_message(f"Atualizando lista de arquivos para: {current_folder}", LogLevel.INFO)
+        self.list_files_in_folder(current_folder)
+
+    def get_selected_delimiter(self):
+        try:
+            selected = self.delimiter_combo.currentText()
+            if selected == "Outro...":
+                return self.delimiter_custom_edit.text()
+            elif selected == "Tabulação (Tab)":
+                return '\t'
+            elif "(" in selected and ")" in selected:
+                return selected.split("(")[1].replace(")", "")
+            else:
+                return selected
+        except RuntimeError as e:
+            if "already deleted" in str(e):
+                self.log_message("AVISO: Widget de delimitador foi destruído inesperadamente. Usando ';' como padrão.", LogLevel.WARNING)
+                return "|"
+            else:
+                raise
     
     def mark_all_sheets(self):
         self._set_all_sheets_check_state(Qt.Checked)
@@ -737,78 +1837,128 @@ class MainWindow(QMainWindow):
         if not self.current_files_paths:
             self.log_message("Selecione uma pasta e arquivos primeiro.", LogLevel.WARNING)
             return
+        
+        if self.header_analyzer_thread and self.header_analyzer_thread.isRunning():
+            self.log_message("A análise de cabeçalhos já está em andamento.", LogLevel.INFO)
+            return # Evita iniciar múltiplas análises
 
-        self.log_message("Analisando cabeçalhos dos arquivos selecionados...", LogLevel.INFO)
-        unique_headers = set()
+        # self.log_message("Analisando cabeçalhos dos arquivos selecionados...", LogLevel.INFO)
+        # unique_headers = set()
         
         # Usar get_files_and_sheets_to_process para saber quais arquivos/abas considerar
         files_and_sheets_config = self.get_files_and_sheets_to_process()
         if not files_and_sheets_config:
             self.log_message("Nenhum arquivo/aba configurado para processamento. Não é possível mapear cabeçalhos.", LogLevel.WARNING)
             return
+        
+        self.log_message("Analisando cabeçalhos dos arquivos selecionados (em segundo plano)...", LogLevel.INFO)
+        self.map_headers_button.setEnabled(False) # Desabilita botão para evitar cliques duplos
+        selected_delimiter = self.get_selected_delimiter()
+        if not selected_delimiter:
+            self.log_message("Análise de cabeçalhos falhou: Delimitador inválido para CSV/TXT.", LogLevel.ERROR)
+            self.map_headers_button.setEnabled(True)
+            return
+        self.define_filters_button.setEnabled(False)
+        self.filter_rules.clear()
+        self.header_analyzer_thread = HeaderAnalysisWorker(files_and_sheets_config, selected_delimiter)
+        self.header_analyzer_thread.finished.connect(self.on_header_analysis_finished)
+        self.header_analyzer_thread.progress_log.connect(self.log_message)
+        self.header_analyzer_thread.start()
 
+        # =============== DESCARTADA ===============
         # Pequena thread para não travar a GUI ao ler cabeçalhos
         # (Pode ser excessivo para apenas cabeçalhos, mas bom se houver muitos arquivos)
         # Por simplicidade no MVP do mapeamento, vamos fazer síncrono por enquanto.
         # Se ficar lento, podemos mover para uma thread.
         
-        processed_for_headers = 0
-        for file_path, selected_sheets in files_and_sheets_config:
-            file_name = os.path.basename(file_path)
-            try:
-                if file_path.lower().endswith(".csv"):
-                    reader = pl.read_csv_batched(file_path, batch_size=5, infer_schema_length=0, encoding = 'latin-1', separator = ';') 
-                    batches = reader.next_batches(1) 
+        # processed_for_headers = 0
+        # for file_path, selected_sheets in files_and_sheets_config:
+        #     file_name = os.path.basename(file_path)
+        #     try:
+        #         if file_path.lower().endswith(".csv"):
+        #             reader = pl.read_csv_batched(file_path, batch_size=5, infer_schema_length=0, encoding = 'latin-1', separator = ';') 
+        #             batches = reader.next_batches(1) 
                     
-                    if batches and len(batches) > 0:
-                            first_batch = batches[0]
-                            if first_batch is not None and first_batch.width > 0:
-                                unique_headers.update(first_batch.columns)
-                    # else: Tratar CSV vazio ou só com cabeçalho (opcional)
+        #             if batches and len(batches) > 0:
+        #                     first_batch = batches[0]
+        #                     if first_batch is not None and first_batch.width > 0:
+        #                         unique_headers.update(first_batch.columns)
+        #             # else: Tratar CSV vazio ou só com cabeçalho (opcional)
 
-                elif file_path.lower().endswith((".xlsx", ".xls")) and selected_sheets:
-                    for sheet_name in selected_sheets:
-                        # Ler apenas a primeira linha da aba
-                        # df_header = pl.read_excel(file_path, sheet_name=sheet_name, n_rows=1, infer_schema_length=0) # n_rows não é para read_excel
-                        # Ler e pegar head(0).columns ou head(1).columns
-                        try:
-                            df_sample = pl.read_excel(file_path, sheet_name=sheet_name).head(0) # Pega só cabeçalhos
-                        except pl.exceptions.PolarsError as e_excel:
-                            error_msg_lower = str(e_excel).lower()
-                            is_numeric_conversion_error = ('conversion' in error_msg_lower and 'f64' in error_msg_lower or 'float' in error_msg_lower) and ('i64' in error_msg_lower or 'int' in error_msg_lower) and 'failed' in error_msg_lower
-                            if is_numeric_conversion_error:
-                                try:
-                                    df_temp = pl.read_excel(source = file_path, sheet_name = sheet_name, infer_schema_length = 0)
-                                    if df_temp is not None:
-                                        df_sample = df_temp.select([pl.all().cast(pl.String)])
-                                        # df_preview_sliced = df_original.head(n_rows_to_preview)
-                                    else:
-                                        df_sample = None
-                                except Exception as e_retry_excel:
-                                    df_sample = None
-                            else:
-                                df_sample = None
-                        if df_sample.width > 0:
-                             unique_headers.update(df_sample.columns)
-                processed_for_headers +=1
-                # TODO: Adicionar feedback de progresso se for demorado
-            except Exception as e:
-                self.log_message(f"Erro ao ler cabeçalhos de '{file_name}' (Aba: {sheet_name if selected_sheets else 'N/A'}): {e}", LogLevel.ERROR)
+        #         elif file_path.lower().endswith((".xlsx", ".xls")) and selected_sheets:
+        #             for sheet_name in selected_sheets:
+        #                 # Ler apenas a primeira linha da aba
+        #                 # df_header = pl.read_excel(file_path, sheet_name=sheet_name, n_rows=1, infer_schema_length=0) # n_rows não é para read_excel
+        #                 # Ler e pegar head(0).columns ou head(1).columns
+        #                 try:
+        #                     df_sample = pl.read_excel(file_path, sheet_name=sheet_name).head(0) # Pega só cabeçalhos
+        #                 except pl.exceptions.PolarsError as e_excel:
+        #                     error_msg_lower = str(e_excel).lower()
+        #                     is_numeric_conversion_error = ('conversion' in error_msg_lower and 'f64' in error_msg_lower or 'float' in error_msg_lower) and ('i64' in error_msg_lower or 'int' in error_msg_lower) and 'failed' in error_msg_lower
+        #                     if is_numeric_conversion_error:
+        #                         try:
+        #                             df_temp = pl.read_excel(source = file_path, sheet_name = sheet_name, infer_schema_length = 0)
+        #                             if df_temp is not None:
+        #                                 df_sample = df_temp.select([pl.all().cast(pl.String)])
+        #                                 # df_preview_sliced = df_original.head(n_rows_to_preview)
+        #                             else:
+        #                                 df_sample = None
+        #                         except Exception as e_retry_excel:
+        #                             df_sample = None
+        #                     else:
+        #                         df_sample = None
+        #                 if df_sample.width > 0:
+        #                      unique_headers.update(df_sample.columns)
+        #         processed_for_headers +=1
+        #         # TODO: Adicionar feedback de progresso se for demorado
+        #     except Exception as e:
+        #         self.log_message(f"Erro ao ler cabeçalhos de '{file_name}' (Aba: {sheet_name if selected_sheets else 'N/A'}): {e}", LogLevel.ERROR)
 
-        if not unique_headers:
-            self.log_message("Nenhum cabeçalho encontrado ou erro ao ler todos os cabeçalhos.", LogLevel.WARNING)
+        # if not unique_headers:
+        #     self.log_message("Nenhum cabeçalho encontrado ou erro ao ler todos os cabeçalhos.", LogLevel.WARNING)
+        #     return
+
+        # self.log_message(f"Cabeçalhos únicos encontrados: {len(unique_headers)}", LogLevel.SUCCESS)
+        
+        # # Passar o self.header_mapping existente para o diálogo
+        # dialog = HeaderMappingDialog(unique_headers, self, self.header_mapping)
+        # if dialog.exec() == QDialog.Accepted: # .exec_() em PyQt5
+        #     self.header_mapping = dialog.get_mapping()
+        #     self.log_message("Mapeamento de cabeçalhos atualizado.", LogLevel.SUCCESS)
+        #     # Logar o mapeamento para depuração (opcional)
+        #     # for original, map_info in self.header_mapping.items():
+        #     #     self.log_message(f"  '{original}' -> '{map_info['final_name']}' (Incluir: {map_info['include']})", LogLevel.INFO)
+        # else:
+        #     self.log_message("Mapeamento de cabeçalhos cancelado.", LogLevel.INFO)
+    
+    def on_header_analysis_finished(self, suggested_groups, error_object):
+        """Chamado quando a HeaderAnalysisWorker termina."""
+        self.map_headers_button.setEnabled(True) # Reabilita o botão
+        if self.header_analyzer_thread: # Garante que a thread exista antes de tentar limpá-la
+            self.header_analyzer_thread = None # Limpa a referência da thread
+
+        if error_object:
+            if isinstance(error_object, InterruptedError):
+                self.log_message(f"Análise de cabeçalhos cancelada: {error_object}", LogLevel.WARNING)
+            else:
+                self.log_message(f"Erro durante a análise de cabeçalhos: {error_object}", LogLevel.ERROR)
             return
 
-        self.log_message(f"Cabeçalhos únicos encontrados: {len(unique_headers)}", LogLevel.SUCCESS)
-        
+        if not suggested_groups:
+            self.log_message("Nenhum cabeçalho encontrado ou erro ao ler todos os cabeçalhos. Verifique os arquivos e seleções de abas.", LogLevel.WARNING)
+            return
+
+        self.log_message(f"Análise concluída. Cabeçalhos únicos encontrados: {len(suggested_groups)}", LogLevel.SUCCESS)
+
         # Passar o self.header_mapping existente para o diálogo
-        dialog = HeaderMappingDialog(unique_headers, self, self.header_mapping)
-        if dialog.exec() == QDialog.Accepted: # .exec_() em PyQt5
+        dialog = HeaderMappingDialog(suggested_groups, self, self.header_mapping)
+        if dialog.exec() == QDialog.Accepted: # .exec() em PySide6 (era exec_() em PyQt5)
             self.header_mapping = dialog.get_mapping()
             self.log_message("Mapeamento de cabeçalhos atualizado.", LogLevel.SUCCESS)
-            # Logar o mapeamento para depuração (opcional)
+            self.define_filters_button.setEnabled(True)
+            # Opcional: Logar o mapeamento para depuração
             # for original, map_info in self.header_mapping.items():
-            #     self.log_message(f"  '{original}' -> '{map_info['final_name']}' (Incluir: {map_info['include']})", LogLevel.INFO)
+            #     self.log_message(f"  '{original}' -> '{map_info['final_name']}' (Tipo: {map_info['type_str']}, Incluir: {map_info['include']})", LogLevel.INFO)
         else:
             self.log_message("Mapeamento de cabeçalhos cancelado.", LogLevel.INFO)
     
@@ -831,22 +1981,15 @@ class MainWindow(QMainWindow):
             self.preview_table_model.clear_data()
             return
 
-        if file_path.lower().endswith(".csv"):
-            self.update_preview(file_path)
+        if file_path.lower().endswith((".csv", ".txt")):
+            self.update_preview(file_path) # Pré-visualiza CSV diretamente
         elif file_path.lower().endswith((".xlsx", ".xls")):
-            # Para Excel, a pré-visualização será acionada por on_sheet_list_item_selected_for_preview
-            # ou se houver apenas uma aba, podemos visualizá-la diretamente.
-            # Por agora, vamos esperar a seleção de aba. Ou, se a lista de abas tiver itens,
-            # pegar o primeiro item da lista de abas (se houver) e tentar visualizá-lo.
-            if self.sheets_list_widget.count() > 0:
-                # Tenta selecionar a primeira aba da lista para acionar a pré-visualização dela
-                first_sheet_item = self.sheets_list_widget.item(0)
-                if first_sheet_item: # Garante que o item existe
-                    self.sheets_list_widget.setCurrentItem(first_sheet_item) 
-                    # A chamada acima deve acionar on_sheet_list_item_selected_for_preview
-            else: # Arquivo Excel sem abas visíveis (ou erro ao listar)
-                self.preview_table_model.clear_data()
-        else:
+            # Para Excel, a pré-visualização da aba será acionada por:
+            # a) on_sheet_loading_finished (que seleciona a primeira aba) -> on_sheet_list_item_selected_for_preview
+            # b) clique manual do usuário em uma aba -> on_sheet_list_item_selected_for_preview
+            # Podemos limpar a pré-visualização aqui, e ela será preenchida quando as abas carregarem e uma for selecionada.
+            self.preview_table_model.clear_data()
+        else: # Outros tipos de arquivo (não deve acontecer se o filtro de arquivos estiver correto)
             self.preview_table_model.clear_data()
 
 
@@ -872,53 +2015,75 @@ class MainWindow(QMainWindow):
 
 
     def update_preview(self, file_path, sheet_name=None, n_rows_to_preview=50):
-        self.log_message(f"Tentando gerar pré-visualização para: {os.path.basename(file_path)}" + (f" - Aba: {sheet_name}" if sheet_name else ""), LogLevel.INFO)
+        self.log_message(f"Gerando pré-visualização para: {os.path.basename(file_path)}" + (f" - Aba: {sheet_name}" if sheet_name else ""), LogLevel.INFO)
         try:
-            df_preview_full = None 
-            df_preview_sliced = None 
-
-            if file_path.lower().endswith(".csv"):
-                df_preview_sliced = pl.read_csv(file_path, n_rows=n_rows_to_preview, try_parse_dates=True, encoding = 'latin-1', separator = ';', infer_schema = False) # try_parse_dates é válido aqui
+            n_preread_rows = 20
+            header_row_index = 0
+            df_preview_sliced = None
+            
+            # 1. Pré-leitura para detectar o cabeçalho
+            pre_read_df = None
+            delimiter = self.get_selected_delimiter() if file_path.lower().endswith((".csv", ".txt")) else None
+            
+            if file_path.lower().endswith((".csv", ".txt")):
+                if not delimiter:
+                    self.log_message("Pré-visualização falhou: Delimitador inválido.", LogLevel.ERROR)
+                    return
+                pre_read_df = pl.read_csv(source=file_path, has_header=False, n_rows=n_preread_rows, separator=delimiter, encoding='latin-1', ignore_errors=True, infer_schema = False, quote_char = None, truncate_ragged_lines = True)
             elif file_path.lower().endswith((".xlsx", ".xls")) and sheet_name:
-                # Simplificando a leitura do Excel, a inferência de datas padrão do Polars é geralmente boa.
-                try:
-                    df_preview_full = pl.read_excel(file_path, sheet_name=sheet_name) 
-                    if df_preview_full is not None:
-                        df_preview_sliced = df_preview_full.head(n_rows_to_preview)
-                except pl.exceptions.PolarsError as e_excel:
-                    error_msg_lower = str(e_excel).lower()
-                    is_numeric_conversion_error = ('conversion' in error_msg_lower and 'f64' in error_msg_lower or 'float' in error_msg_lower) and ('i64' in error_msg_lower or 'int' in error_msg_lower) and 'failed' in error_msg_lower
-                    if is_numeric_conversion_error:
-                        try:
-                            df_temp = pl.read_excel(source = file_path, sheet_name = sheet_name, infer_schema_length = 0)
-                            if df_temp is not None:
-                                df_original = df_temp.select([pl.all().cast(pl.String)])
-                                df_preview_sliced = df_original.head(n_rows_to_preview)
-                            else:
-                                df_original = None
-                        except Exception as e_retry_excel:
-                            df_original = None
-                    else:
-                        df_original = None
-            if df_preview_sliced is not None and df_preview_sliced.height > 0:
+                pre_read_df = pl.read_excel(source=file_path, sheet_name=sheet_name, has_header = False).head(n_preread_rows)
+
+            if pre_read_df is not None and not pre_read_df.is_empty():
+                header_row_index = _find_header_row_index(pre_read_df, n_preread_rows)
+
+                # 2. Extrair cabeçalhos, dados e renomear (a lógica robusta)
+                header_names = [str(h) if h is not None else f"column_{i}" for i, h in enumerate(pre_read_df.row(header_row_index))]
+                data_rows = pre_read_df.slice(offset=header_row_index + 1).head(n_rows_to_preview)
+                
+                if not data_rows.is_empty():
+                    rename_mapping = {old_name: new_name for old_name, new_name in zip(data_rows.columns, header_names)}
+                    df_preview_sliced = data_rows.rename(rename_mapping)
+
+            # 3. Carregar os dados no modelo da tabela
+            if df_preview_sliced is not None and not df_preview_sliced.is_empty():
                 self.preview_table_model.load_data(df_preview_sliced)
                 self.log_message(f"Pré-visualização gerada com {df_preview_sliced.height} linhas.", LogLevel.SUCCESS)
-            elif df_preview_sliced is not None and df_preview_sliced.height == 0 :
-                 self.log_message(f"O arquivo/aba {os.path.basename(file_path)} está vazio ou as primeiras {n_rows_to_preview} linhas estão vazias.", LogLevel.WARNING)
-                 self.preview_table_model.clear_data()
             else:
+                self.log_message(f"O arquivo/aba {os.path.basename(file_path)} está vazio ou não foi possível ler dados para pré-visualização.", LogLevel.WARNING)
                 self.preview_table_model.clear_data()
 
         except Exception as e:
             self.log_message(f"Erro ao gerar pré-visualização para {os.path.basename(file_path)}: {e}", LogLevel.ERROR)
             self.preview_table_model.clear_data()
+    
+    def open_filter_dialog(self):
+        if not self.header_mapping:
+            self.log_message("Por favor, analise e mapeie os cabeçalhos primeiro.", LogLevel.WARNING)
+            return
+        final_headers = {
+            map_info['final_name'] for map_info in self.header_mapping.values() if map_info.get('include')
+        }
+        if not final_headers:
+            self.log_message("Nenhym cabeçalho final encontrado no mapeamento. Impossível definir filtros", LogLevel.WARNING)
+            return
+        dialog = FilterDialog(list(final_headers), self.filter_rules, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.filter_rules = dialog.get_filters()
+            self.log_message(f"Filtros atualizados. {len(self.filter_rules)} regra(s) ativa(s)", LogLevel.SUCCESS)
+        else:
+            self.log_message("Definição de filtros cancelada.", LogLevel.INFO)
 
     def on_file_selected(self, current_file_item, previous_file_item):
-        """Chamado quando um arquivo é selecionado na lista de arquivos."""
-        self.sheets_list_widget.clear() # Limpa visualmente
+        """Chamado quando um arquivo é selecionado na lista de arquivos. Delega o carregamento de abas para uma thread."""
+        self.sheets_list_widget.clear()
         self.sheets_list_widget.setEnabled(False)
+        self.mark_all_sheets_button.setEnabled(False)
+        self.unmark_all_sheets_button.setEnabled(False)
+        # self.preview_table_model.clear_data() # A pré-visualização é tratada por on_file_selected_for_preview
 
-        can_manage_sheets = False
+        if self.sheet_loader_thread and self.sheet_loader_thread.isRunning():
+            self.sheet_loader_thread.stop() # Solicita parada da thread anterior
+            # Não esperar aqui para não bloquear a UI, a thread antiga morrerá ou emitirá um resultado que será ignorado
 
         if not current_file_item:
             return
@@ -930,76 +2095,115 @@ class MainWindow(QMainWindow):
             self.log_message(f"Caminho não encontrado para o arquivo: {selected_file_name}", LogLevel.ERROR)
             return
 
-        # Desconectar temporariamente o sinal para evitar chamadas recursivas ou indesejadas
-        # ao popular programaticamente a lista de abas.
-        try:
-            self.sheets_list_widget.itemChanged.disconnect(self.on_sheet_selection_changed)
-        except RuntimeError: # Se não estava conectado ainda
-            pass
+        # CSVs não têm abas, então não iniciar a thread para eles aqui.
+        # A lógica de pré-visualização de CSV é tratada em on_file_selected_for_preview
+        if file_path.lower().endswith((".xlsx", ".xls")):
+            self.log_message(f"Carregando abas para '{selected_file_name}'...", LogLevel.INFO)
+            self.sheets_list_widget.setEnabled(False) # Garante que esteja desabilitada
+            self.mark_all_sheets_button.setEnabled(False)
+            self.unmark_all_sheets_button.setEnabled(False)
 
-        # can_manage_sheets = True 
+            self.sheet_loader_thread = SheetLoadingWorker(file_path)
+            self.sheet_loader_thread.finished.connect(self.on_sheet_loading_finished)
+            self.sheet_loader_thread.start()
+        else: # Arquivo não-Excel (ex: CSV) selecionado
+            self.log_message(f"Arquivo selecionado: {selected_file_name} (Não é Excel, sem abas para listar).", LogLevel.INFO)
+            # A pré-visualização de CSV será acionada por on_file_selected_for_preview
+            # Nenhuma aba para popular, então botões de aba permanecem desabilitados.
 
-        sheet_names_from_file = []
-        try:
-            if file_path.lower().endswith(".xlsx"):
-                workbook = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-                sheet_names_from_file = workbook.sheetnames
-                # self.mark_all_sheets_button.setEnabled(can_manage_sheets)
-                # self.unmark_all_sheets_button.setEnabled(can_manage_sheets)
-            elif file_path.lower().endswith(".xls"):
-                workbook = xlrd.open_workbook(file_path, on_demand=True)
-                sheet_names_from_file = workbook.sheet_names()
-                # self.mark_all_sheets_button.setEnabled(can_manage_sheets)
-                # self.unmark_all_sheets_button.setEnabled(can_manage_sheets)
-            else: # CSV ou outro tipo, sem abas
-                self.log_message(f"Arquivo selecionado: {selected_file_name} (Não é Excel).", LogLevel.INFO)
-                # Reconectar o sinal
-                self.sheets_list_widget.itemChanged.connect(self.on_sheet_selection_changed)
-                return
 
-            if sheet_names_from_file:
-                self.sheets_list_widget.setEnabled(True)
-                
-                # Verificar se já temos seleções salvas para este arquivo
-                # Se não, criamos uma entrada com todas as abas marcadas por padrão
-                if file_path not in self.sheet_selections:
-                    self.sheet_selections[file_path] = {name: True for name in sheet_names_from_file}
-                
-                # Obter as seleções atuais para este arquivo (pode ter sido modificado)
-                current_sheet_states = self.sheet_selections[file_path]
+    def on_sheet_loading_finished(self, file_path_processed, sheet_names, error_message):
+        """Chamado quando a SheetLoadingWorker termina de carregar as abas."""
+        # Verificar se o resultado ainda é para o arquivo atualmente selecionado
+        current_selected_file_item = self.files_list_widget.currentItem()
+        if not current_selected_file_item or self.current_files_paths.get(current_selected_file_item.text()) != file_path_processed:
+            self.log_message(f"Resultado do carregamento de abas para '{os.path.basename(file_path_processed)}' ignorado (seleção mudou).", LogLevel.INFO)
+            if self.sheet_loader_thread and self.sheet_loader_thread.file_path == file_path_processed:
+                self.sheet_loader_thread = None # Limpa a referência da thread que acabou
+            return
 
-                for sheet_name in sheet_names_from_file:
-                    item = QListWidgetItem(sheet_name)
-                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                    # Define o estado do checkbox com base no que está salvo em self.sheet_selections
-                    # Se a aba não existir mais no arquivo, mas estiver em sheet_selections (raro), ignora.
-                    # Se a aba for nova no arquivo, o default é True (do passo anterior).
-                    is_checked = current_sheet_states.get(sheet_name, True) # Default para True se for nova
-                    item.setCheckState(Qt.Checked if is_checked else Qt.Unchecked)
-                    self.sheets_list_widget.addItem(item)
-                
-                log_suffix = " (carregadas do cache)" if file_path in self.sheet_selections and any(not s for s in current_sheet_states.values()) else " (todas marcadas por padrão)"
-                self.log_message(f"Abas encontradas para '{selected_file_name}': {', '.join(sheet_names_from_file)}.{log_suffix}", LogLevel.INFO)
+        selected_file_name = os.path.basename(file_path_processed) # Obter nome do arquivo do caminho processado
 
-            else:
-                self.log_message(f"Nenhuma aba encontrada no arquivo Excel: {selected_file_name}", LogLevel.WARNING)
-                # Se não há abas, limpar qualquer entrada antiga em sheet_selections
-                if file_path in self.sheet_selections:
-                    del self.sheet_selections[file_path]
-            if self.sheets_list_widget.isEnabled() and self.sheets_list_widget.count() > 0:
-                can_manage_sheets = True
-            
-            self.mark_all_sheets_button.setEnabled(can_manage_sheets)
-            self.unmark_all_sheets_button.setEnabled(can_manage_sheets)
-        
-        except Exception as e:
-            self.log_message(f"Erro ao ler abas do arquivo {selected_file_name}: {e}", LogLevel.ERROR)
-            if file_path in self.sheet_selections: # Limpar se deu erro
-                 del self.sheet_selections[file_path]
-        finally:
-            # Reconectar o sinal itemChanged após a população
+        if error_message:
+            self.log_message(error_message, LogLevel.ERROR)
+            if file_path_processed in self.sheet_selections: # Limpar se deu erro
+                del self.sheet_selections[file_path_processed]
+            self.sheets_list_widget.clear() # Garante que a lista de abas esteja limpa
+            self.sheets_list_widget.setEnabled(False)
+            self.mark_all_sheets_button.setEnabled(False)
+            self.unmark_all_sheets_button.setEnabled(False)
+            if self.sheet_loader_thread and self.sheet_loader_thread.file_path == file_path_processed:
+                self.sheet_loader_thread = None
+            return
+
+        # Sucesso no carregamento das abas
+        self.log_message(f"Abas carregadas para '{selected_file_name}'.", LogLevel.INFO)
+        can_manage_sheets = False
+        if sheet_names:
+            self.sheets_list_widget.setEnabled(True)
+            can_manage_sheets = True
+
+            # Desconectar temporariamente o sinal para evitar chamadas recursivas
+            try:
+                self.sheets_list_widget.itemChanged.disconnect(self.on_sheet_selection_changed)
+            except RuntimeError:
+                pass
+
+            # Verificar se já temos seleções salvas para este arquivo
+            if file_path_processed not in self.sheet_selections:
+                self.sheet_selections[file_path_processed] = {name: True for name in sheet_names}
+
+            current_sheet_states = self.sheet_selections[file_path_processed]
+
+            # Adicionar abas que estão no arquivo, mas talvez não em current_sheet_states (se o arquivo mudou)
+            for sheet_name in sheet_names:
+                if sheet_name not in current_sheet_states:
+                    current_sheet_states[sheet_name] = True # Default para incluir novas abas
+
+            # Remover abas de current_sheet_states que não existem mais no arquivo
+            # (Isso garante que self.sheet_selections reflita apenas abas existentes)
+            # Criar uma cópia das chaves para iterar, pois podemos modificar o dicionário
+            for stored_sheet_name in list(current_sheet_states.keys()):
+                if stored_sheet_name not in sheet_names:
+                    del current_sheet_states[stored_sheet_name]
+
+            self.sheets_list_widget.clear() # Limpar antes de repopular
+            for sheet_name in sheet_names: # Iterar sobre as abas reais do arquivo
+                item = QListWidgetItem(sheet_name)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                is_checked = current_sheet_states.get(sheet_name, True) # Default para True
+                item.setCheckState(Qt.Checked if is_checked else Qt.Unchecked)
+                self.sheets_list_widget.addItem(item)
+
+            log_suffix = " (carregadas do cache/atualizadas)" if any(not s for s in current_sheet_states.values()) else " (todas marcadas por padrão/atualizadas)"
+            self.log_message(f"Abas encontradas para '{selected_file_name}': {', '.join(sheet_names)}.{log_suffix}", LogLevel.INFO)
+
+            # Reconectar o sinal
             self.sheets_list_widget.itemChanged.connect(self.on_sheet_selection_changed)
 
+            # Tenta pré-selecionar e pré-visualizar a primeira aba, se houver
+            if self.sheets_list_widget.count() > 0:
+                first_sheet_item = self.sheets_list_widget.item(0)
+                if first_sheet_item:
+                    # Se on_file_selected_for_preview também chama on_file_selected,
+                    # precisamos garantir que on_file_selected não reinicie a thread de abas desnecessariamente.
+                    # No entanto, on_file_selected_for_preview chama on_file_selected PRIMEIRO.
+                    # A chamada a setCurrentItem aqui irá disparar on_sheet_list_item_selected_for_preview, que é para a pré-visualização.
+                    self.sheets_list_widget.setCurrentItem(first_sheet_item)
+
+
+        else: # Nenhuma aba encontrada
+            self.log_message(f"Nenhuma aba encontrada no arquivo Excel: {selected_file_name}", LogLevel.WARNING)
+            if file_path_processed in self.sheet_selections:
+                del self.sheet_selections[file_path_processed]
+            self.sheets_list_widget.clear()
+            self.sheets_list_widget.setEnabled(False)
+
+        self.mark_all_sheets_button.setEnabled(can_manage_sheets)
+        self.unmark_all_sheets_button.setEnabled(can_manage_sheets)
+
+        if self.sheet_loader_thread and self.sheet_loader_thread.file_path == file_path_processed:
+            self.sheet_loader_thread = None # Limpa a referência da thread que acabou
 
     def on_sheet_selection_changed(self, item_changed: QListWidgetItem):
         """Chamado quando o estado de um checkbox de aba muda."""
@@ -1028,58 +2232,54 @@ class MainWindow(QMainWindow):
     def get_files_and_sheets_to_process(self):
         files_to_process_list = []
         if not self.current_files_paths:
-             self.log_message("Nenhuma pasta selecionada ou nenhum arquivo encontrado.", LogLevel.WARNING)
-             return None
+            self.log_message("Nenhuma pasta selecionada ou nenhum arquivo encontrado.", LogLevel.WARNING)
+            return None
 
         for file_name, file_path in self.current_files_paths.items():
-            selected_sheets_for_file = []
             is_excel = file_path.lower().endswith((".xlsx", ".xls"))
 
             if is_excel:
-                # Usar as seleções armazenadas em self.sheet_selections
-                if file_path in self.sheet_selections:
-                    for sheet_name, is_selected in self.sheet_selections[file_path].items():
-                        if is_selected:
-                            selected_sheets_for_file.append(sheet_name)
-                    
-                    if not selected_sheets_for_file:
-                        self.log_message(f"Nenhuma aba marcada para o arquivo Excel '{file_name}' nas configurações. Será pulado.", LogLevel.WARNING)
-                        # Não adiciona à lista de processamento se explicitamente nenhuma aba foi marcada
-                        continue # Pula para o próximo arquivo
-                else:
-                    # Fallback: Se por algum motivo não há entrada (ex: arquivo adicionado e nunca selecionado),
-                    # processar todas as abas como padrão.
-                    self.log_message(f"Nenhuma seleção de abas encontrada para '{file_name}'. Processando todas as abas por padrão.", LogLevel.INFO)
-                    try:
-                        if file_path.lower().endswith(".xlsx"):
-                            workbook = openpyxl.load_workbook(file_path, read_only=True)
-                            selected_sheets_for_file = workbook.sheetnames
-                        elif file_path.lower().endswith(".xls"):
-                            workbook = xlrd.open_workbook(file_path, on_demand=True)
-                            selected_sheets_for_file = workbook.sheet_names()
-                    except Exception as e:
-                        self.log_message(f"Erro ao tentar obter todas as abas de '{file_name}' para fallback: {e}. Pulando arquivo.", LogLevel.ERROR)
-                        continue # Pula este arquivo
+                selected_sheets_for_file = []
                 
-                if not selected_sheets_for_file: # Double check, caso o fallback não encontre abas
-                    self.log_message(f"Arquivo Excel '{file_name}' não tem abas (ou erro ao listá-las no fallback). Será pulado.", LogLevel.WARNING)
-                    continue
+                # --- NOVA LÓGICA DE DECISÃO ---
+                # Se existem regras globais, use-as.
+                if self.sheet_selection_rules and self.all_sheets_cache:
+                    file_sheets = self.all_sheets_cache.get(file_path, [])
+                    rule_mode = self.sheet_selection_rules.get("mode", "include")
+                    rule_names = self.sheet_selection_rules.get("names", set())
 
+                    if rule_mode == "include":
+                        selected_sheets_for_file = [s for s in file_sheets if s in rule_names]
+                    elif rule_mode == "exclude":
+                        selected_sheets_for_file = [s for s in file_sheets if s not in rule_names]
+                
+                # Senão, use a lógica antiga de seleção manual por arquivo.
+                else:
+                    if file_path in self.sheet_selections:
+                        selected_sheets_for_file = [s for s, checked in self.sheet_selections[file_path].items() if checked]
+                    # Se um arquivo nunca foi selecionado, pode não ter entrada. Neste caso, não processará nenhuma aba.
+                    # Isso é melhor do que o comportamento antigo que tentava ler todas.
+                
+                if not selected_sheets_for_file:
+                    self.log_message(f"Nenhuma aba selecionada para o arquivo Excel '{file_name}'. Será pulado.", LogLevel.INFO)
+                    continue
+                
                 files_to_process_list.append((file_path, selected_sheets_for_file))
 
-            elif file_path.lower().endswith(".csv"):
-                files_to_process_list.append((file_path, None)) # None indica CSV
+            elif file_path.lower().endswith((".csv", ".txt")):
+                files_to_process_list.append((file_path, None))
             else:
-                self.log_message(f"Arquivo '{file_name}' não é Excel nem CSV. Pulando.", LogLevel.WARNING)
-        
+                self.log_message(f"Arquivo '{file_name}' não é suportado. Pulando.", LogLevel.WARNING)
+
         if not files_to_process_list:
-            self.log_message("Nenhum arquivo encontrado ou selecionado para processamento após filtrar.", LogLevel.WARNING)
+            self.log_message("Nenhum arquivo encontrado ou selecionado para processamento após aplicar as regras.", LogLevel.WARNING)
             return None
             
         return files_to_process_list
 
 
     def log_message(self, message, level=LogLevel.INFO):
+        self.is_last_log_progress = False
         self.log_console_text_edit.append(f"{level.value} {message}")
 
     def list_files_in_folder(self, folder_path):
@@ -1088,15 +2288,19 @@ class MainWindow(QMainWindow):
         self.sheets_list_widget.clear()
         self.sheets_list_widget.setEnabled(False)
         self.current_files_paths.clear()
-        self.preview_table_model.clear_data() 
-        
-        # Desabilitar o botão no início da função ou quando não há arquivos
-        self.map_headers_button.setEnabled(False) 
-        # Limpar mapeamento de cabeçalhos se a pasta mudar
+        self.preview_table_model.clear_data()
+
+        self.refresh_button.setEnabled(False) 
+        self.map_headers_button.setEnabled(False)
+        self.define_filters_button.setEnabled(False) 
+        self.sheet_selection_button.setEnabled(False)
         self.header_mapping.clear()
+        self.filter_rules.clear()
+        self.sheet_selection_rules.clear()
+        self.all_sheets_cache.clear()
 
 
-        supported_extensions = ("*.xlsx", "*.csv", "*.xls")
+        supported_extensions = ("*.xlsx", "*.csv", "*.xls", "*.txt")
         found_files_paths = []
         try:
             for ext in supported_extensions:
@@ -1110,8 +2314,11 @@ class MainWindow(QMainWindow):
                     self.current_files_paths[file_name] = full_path
                 self.log_message(f"Encontrados {len(found_files_paths)} arquivos na pasta.", LogLevel.SUCCESS)
                 self.map_headers_button.setEnabled(True) # HABILITAR AQUI se arquivos forem encontrados
+                self.refresh_button.setEnabled(True) # E então ele é habilitado
+                excel_files_found = any(f.lower().endswith(('.xlsx', '.xls')) for f in found_files_paths)
+                self.sheet_selection_button.setEnabled(excel_files_found)
             else:
-                self.log_message("Nenhum arquivo suportado (.xlsx, .csv, .xls) encontrado na pasta.", LogLevel.WARNING)
+                self.log_message("Nenhum arquivo suportado (.xlsx, .csv, .xls, .txt) encontrado na pasta.", LogLevel.WARNING)
                 # self.map_headers_button.setEnabled(False) # Já está desabilitado pelo início da função
 
         except Exception as e:
@@ -1122,7 +2329,8 @@ class MainWindow(QMainWindow):
     def update_output_filename_extension(self, selected_format):
         current_name = self.output_name_line_edit.text()
         name_part, _ = os.path.splitext(current_name)
-        new_extension = "." + selected_format.lower()
+        new_extension = ".parquet" if selected_format == "Parquet" else "." + selected_format.lower()
+        # new_extension = "." + selected_format.lower()
         self.output_name_line_edit.setText(name_part + new_extension)
 
     def open_save_file_dialog(self):
@@ -1134,6 +2342,8 @@ class MainWindow(QMainWindow):
             filter_str = "Arquivos Excel (*.xlsx)"
         elif selected_format == "CSV":
             filter_str = "Arquivos CSV (*.csv)"
+        elif selected_format == "Parquet":
+            filter_str = "Arquivos Parquet (*.parquet)"
         else:
             filter_str = "Todos os Arquivos (*)"
         file_path, _ = QFileDialog.getSaveFileName(self, "Salvar Arquivo Consolidado Como...", initial_path, filter_str)
@@ -1146,10 +2356,27 @@ class MainWindow(QMainWindow):
                 self.output_format_combo_box.setCurrentText("XLSX")
             elif ext_part.lower() == ".csv" and self.output_format_combo_box.currentText() != "CSV":
                 self.output_format_combo_box.setCurrentText("CSV")
+            elif ext_part.lower() == ".parquet" and self.output_format_combo_box.currentText != "Parquet":
+                self.output_format_combo_box.setCurrentText("Parquet")
             self.log_message(f"Arquivo de saída definido como: {file_path}", LogLevel.SUCCESS)
         else:
             self.log_message("Seleção de local para salvar cancelada.", LogLevel.INFO)
     
+    def update_progress_text(self, text):
+        """Atualiza a última linha do console com o texto de progresso, ou adiciona uma nova linha se a última não
+        for de progresso."""
+        formatted_text = f"{LogLevel.INFO.value} {text}"
+        cursor = self.log_console_text_edit.textCursor()
+        if self.is_last_log_progress:
+            cursor.movePosition(QTextCursor.End)
+            cursor.select(QTextCursor.BlockUnderCursor)
+            cursor.removeSelectedText()
+        # cursor.insertText(formatted_text)
+        cursor.movePosition(QTextCursor.End)
+        self.log_console_text_edit.append(formatted_text)
+        self.log_console_text_edit.ensureCursorVisible()
+        self.is_last_log_progress = True
+
     def start_consolidation(self):
         if not self.folder_path_line_edit.text():
             self.log_message("Por favor, selecione uma pasta de projeto primeiro.", LogLevel.WARNING)
@@ -1166,11 +2393,18 @@ class MainWindow(QMainWindow):
 
         self.set_ui_for_processing(True)
         output_format = self.output_format_combo_box.currentText()
+        selected_delimiter = self.get_selected_delimiter()
+        if not selected_delimiter:
+            self.log_message("Delimitador inválido ou não definido para arquivos CSV/TXT.", LogLevel.ERROR)
+            self.set_ui_for_processing(False)
+            return
         
-        self.consolidation_thread = ConsolidationWorker(files_to_process, self.output_file_path, output_format, self.header_mapping)
+        
+        self.consolidation_thread = ConsolidationWorker(files_to_process, self.output_file_path, output_format, self.header_mapping, self.filter_rules, selected_delimiter)
         self.consolidation_thread.log_message.connect(self.log_message) 
         self.consolidation_thread.progress_updated.connect(self.update_progress_bar)
         self.consolidation_thread.finished.connect(self.on_consolidation_finished)
+        self.consolidation_thread.progress_text_updated.connect(self.update_progress_text)
         
         self.consolidation_thread.start()
 
@@ -1209,9 +2443,12 @@ class MainWindow(QMainWindow):
         self.output_format_combo_box.setEnabled(not_proc)
         self.save_as_button.setEnabled(not_proc)
         self.consolidate_button.setVisible(not_proc) 
-        self.cancel_button.setVisible(processing)       
+        self.cancel_button.setVisible(processing)
+        # self.progress_bar.setVisible(processing)
+        # self.progress_text_label.setVisible(processing)       
         if not_proc:
             self.progress_bar.setValue(0)
+        self.is_last_log_progress = False
 
     def cancel_consolidation(self):
         if self.consolidation_thread and self.consolidation_thread.isRunning():
@@ -1236,9 +2473,159 @@ class MainWindow(QMainWindow):
             self.log_message("Fechando aplicação, parando consolidação em andamento...", LogLevel.INFO)
             self.consolidation_thread.stop()
             self.consolidation_thread.wait() 
+
+        if self.sheet_loader_thread and self.sheet_loader_thread.isRunning(): # Adicionado
+            self.log_message("Fechando aplicação, parando carregamento de abas...", LogLevel.INFO)
+            self.sheet_loader_thread.stop()
+            self.sheet_loader_thread.wait() # Espera a thread finalizar
+        
+        if self.header_analyzer_thread and self.header_analyzer_thread.isRunning(): # Adicionado
+            self.log_message("Fechando aplicação, parando análise de cabeçalhos...", LogLevel.INFO)
+            self.header_analyzer_thread.stop()
+            self.header_analyzer_thread.wait()
+
         event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    app.setStyle("Fusion")
+
+    # Paleta de cores para o tema claro e profissional
+    light_palette = QPalette()
+    
+    # Cores de fundo e texto gerais
+    light_palette.setColor(QPalette.Window, QColor("#F0F0F0")) # Fundo principal cinza bem claro
+    light_palette.setColor(QPalette.WindowText, QColor("#333333")) # Texto escuro (não preto)
+    
+    # Cores para campos de entrada, listas, tabelas
+    light_palette.setColor(QPalette.Base, QColor("#FFFFFF")) # Fundo branco para inputs
+    light_palette.setColor(QPalette.AlternateBase, QColor("#F5F5F5")) # Cor de linha alternada
+    light_palette.setColor(QPalette.Text, QColor("#333333")) # Texto dentro dos inputs
+    
+    # Cores de botões
+    light_palette.setColor(QPalette.Button, QColor("#E0E0E0")) # Botões cinza claro
+    light_palette.setColor(QPalette.ButtonText, QColor("#333333")) # Texto dos botões
+    
+    # Cores de destaque (seleção, links, etc.)
+    CORPORATE_GREEN = QColor("#86BC25")
+    light_palette.setColor(QPalette.Highlight, CORPORATE_GREEN)
+    light_palette.setColor(QPalette.HighlightedText, Qt.white)
+    
+    # Aplicar a paleta de cores base
+    app.setPalette(light_palette)
+
+    # Folha de estilos QSS para refinamentos
+    professional_stylesheet = """
+        QWidget {
+            font-family: Aptos, Segoe UI, Arial, sans-serif; /* Define a fonte com fallbacks */
+            font-size: 9pt;
+        }
+        QGroupBox {
+            font-weight: bold;
+            font-size: 10pt;
+        }
+        QPushButton {
+            border: 1px solid #B0B0B0;
+            border-radius: 4px;
+            padding: 6px;
+            background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                              stop: 0 #F5F5F5, stop: 1 #E0E0E0);
+            min-width: 80px;
+        }
+        QPushButton:hover {
+            background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                              stop: 0 #FFFFFF, stop: 1 #E8E8E8);
+        }
+        QPushButton:pressed {
+            background-color: #D0D0D0;
+        }
+        QPushButton:disabled {
+            background-color: #E0E0E0;
+            color: #A0A0A0;
+            border-color: #C0C0C0;
+        }
+        /* Estilo especial para o botão de consolidação */
+        #consolidate_button {
+            font-weight: bold;
+            color: white;
+            background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                              stop: 0 #86BC25, stop: 1 #70A01C);
+            border-color: #608918;
+        }
+        #consolidate_button:hover {
+            background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1,
+                                              stop: 0 #92CC2A, stop: 1 #7CB820);
+        }
+        #consolidate_button:pressed {
+            background-color: #70A01C;
+        }
+
+        QLineEdit, QListWidget, QTableWidget, QTextEdit {
+            border: 1px solid #B0B0B0;
+            border-radius: 4px;
+            padding: 4px;
+            background-color: #FFFFFF;
+        }
+        QListWidget {
+            border: 1px solid #B0B0B0;
+            border-radius: 4px;
+            padding: 2px;
+            background-color: #FFFFFF;
+        }
+        QListWidget::item:hover {
+            background-color: #F0F0F0;
+            border-radius: 3px;
+        }
+        QComboBox {
+            border: 1px solid #B0B0B0;
+            border-radius: 4px;
+            padding: 4px;
+            padding-right: 25px;
+            background-color: #FFFFFF;
+        }
+        QComboBox::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 25px;
+            border-left-width: 1px;
+            border-left-color: #B0B0B0;
+            border-left-style: solid;
+            border-top-right-radius: 3px;
+            border-bottom-right-radius: 3px;
+        }
+        QComboBox::down-arrow{
+            image: url(app/down.png);
+            width: 14px;
+            height: 14px;
+        }
+        QComboBox::drop-down:hover{
+            background-color: #E8E8E8
+        }
+        QComboBox, QAbstractItemView::item:selected {
+            background-color: #FFFFFF;
+            color: black;
+        }
+        QHeaderView::section {
+            background-color: #4A5568; /* Cinza-azulado escuro corporativo */
+            color: white;
+            padding: 4px;
+            border: 1px solid #E0E0E0;
+            font-weight: bold;
+        }
+        QProgressBar {
+            border: 1px solid #B0B0B0;
+            border-radius: 5px;
+            text-align: center;
+            color: #333333;
+        }
+        QProgressBar::chunk {
+            background-color: #86BC25; /* Verde corporativo */
+            border-radius: 4px;
+        }
+    """
+    app.setStyleSheet(professional_stylesheet)
+    
     window = MainWindow()
+    window.consolidate_button.setObjectName("consolidate_button")
     sys.exit(app.exec())
